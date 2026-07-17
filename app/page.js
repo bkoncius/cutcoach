@@ -23,5 +23,5 @@ export default function Home() {
     );
   }
   if (!session) return <Auth />;
-  return <CutCoachApp key={session.user.id} />;
+  return <CutCoachApp key={session.user.id} userId={session.user.id} />;
 }

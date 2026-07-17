@@ -20,67 +20,14 @@ import {
   addChatMessage,
 } from "../lib/db";
 import { getSupabase } from "../lib/supabaseClient";
+import { read as readLedger, write as writeLedger, clear as clearLedger } from "../lib/ledgerCache";
+import { syncPushSubscription, unsubscribePush } from "../lib/pushClient";
+import { PROGRAM, SEQUENCE, nextTemplateFor } from "../lib/program";
+import { onTrack } from "../lib/reminders";
+import NotificationSettings from "./NotificationSettings";
+import { Card, Eyebrow, Bar } from "./ui";
 
-/* ---------------- Program definition (Benas's 4-day plan) ---------------- */
-
-const PROGRAM = {
-  lowerA: {
-    name: "Lower A",
-    subtitle: "Squat focus",
-    finisher: "10 min Zone 2 (incline walk / row)",
-    exercises: [
-      { name: "Back Squat", sets: 4, reps: "5–6", rpe: "7–8" },
-      { name: "Romanian Deadlift", sets: 3, reps: "8–10", rpe: "8" },
-      { name: "Walking Lunge (DB)", sets: 3, reps: "10/leg", rpe: "8" },
-      { name: "Seated Leg Curl", sets: 3, reps: "12–15", rpe: "9" },
-      { name: "Standing Calf Raise", sets: 4, reps: "12–15", rpe: "9" },
-      { name: "Hanging Knee Raise", sets: 3, reps: "10–15", rpe: "—" },
-    ],
-  },
-  upperA: {
-    name: "Upper A",
-    subtitle: "Bench focus",
-    finisher: "Bike intervals 8 × 20s hard / 40s easy",
-    exercises: [
-      { name: "Barbell Bench Press", sets: 4, reps: "5–6", rpe: "7–8" },
-      { name: "Lat Pulldown / Pull-up", sets: 4, reps: "6–8", rpe: "8" },
-      { name: "Seated DB Shoulder Press", sets: 3, reps: "8–10", rpe: "8" },
-      { name: "Chest-Supported Row", sets: 3, reps: "10–12", rpe: "8" },
-      { name: "Lateral Raise", sets: 3, reps: "12–15", rpe: "9" },
-      { name: "EZ-Bar Curl", sets: 3, reps: "12", rpe: "9" },
-      { name: "Rope Pushdown", sets: 3, reps: "12", rpe: "9" },
-    ],
-  },
-  lowerB: {
-    name: "Lower B",
-    subtitle: "Deadlift / posterior",
-    finisher: "12–15 min Zone 2",
-    exercises: [
-      { name: "Deadlift", sets: 3, reps: "5", rpe: "7–8" },
-      { name: "Leg Press / Hack Squat", sets: 3, reps: "10–12", rpe: "8" },
-      { name: "Hip Thrust", sets: 3, reps: "10–12", rpe: "8" },
-      { name: "Leg Extension", sets: 3, reps: "15", rpe: "9" },
-      { name: "Seated Calf Raise", sets: 4, reps: "15", rpe: "9" },
-      { name: "Cable Crunch", sets: 3, reps: "12–15", rpe: "—" },
-    ],
-  },
-  upperB: {
-    name: "Upper B",
-    subtitle: "Overhead / back",
-    finisher: "Intervals or 15 min Zone 2",
-    exercises: [
-      { name: "Overhead Press", sets: 4, reps: "6–8", rpe: "7–8" },
-      { name: "Incline DB Press", sets: 3, reps: "8–10", rpe: "8" },
-      { name: "Seated Cable Row", sets: 4, reps: "10–12", rpe: "8" },
-      { name: "Face Pull", sets: 3, reps: "15", rpe: "9" },
-      { name: "Cable Fly / Pec Deck", sets: 3, reps: "12–15", rpe: "9" },
-      { name: "Hammer Curl", sets: 3, reps: "12", rpe: "9" },
-      { name: "Overhead Triceps Ext", sets: 3, reps: "12", rpe: "9" },
-    ],
-  },
-};
-const SEQUENCE = ["lowerA", "upperA", "lowerB", "upperB"];
-const APP_VERSION = "3.0";
+const APP_VERSION = "3.1";
 
 const DEFAULT_SETTINGS = {
   phase: "cut",
@@ -89,6 +36,10 @@ const DEFAULT_SETTINGS = {
   startWeight: 87,
   targetWeight: 75,
   lastCheckin: null,
+  timezone: null,
+  // Empty, not DEFAULT_REMINDERS: the dispatcher requires an explicit enabled:true,
+  // so nothing fires until you've actually opened the reminders card and saved.
+  reminders: {},
 };
 
 const PHASES = {
@@ -124,41 +75,24 @@ const todayKey = () => {
 const shortDate = (k) => k.slice(5).replace("-", ".");
 const fmt1 = (n) => (Math.round(n * 10) / 10).toFixed(1);
 
-/* ---------------- Shared UI bits ---------------- */
+const TABS = ["today", "food", "train", "trend", "coach"];
 
-function Eyebrow({ children, color = "text-slate-500" }) {
-  return (
-    <div className={`text-xs font-semibold uppercase tracking-widest ${color}`}>{children}</div>
-  );
-}
-
-function Card({ children, className = "" }) {
-  return (
-    <div className={`rounded-2xl border border-slate-800 bg-slate-900 p-4 ${className}`}>
-      {children}
-    </div>
-  );
-}
-
-function Bar({ value, max, color }) {
-  const pct = Math.min(100, max > 0 ? (value / max) * 100 : 0);
-  const over = value > max;
-  return (
-    <div className="h-2 w-full rounded-full bg-slate-800 overflow-hidden">
-      <div
-        className={`h-full rounded-full ${over ? "bg-rose-400" : color}`}
-        style={{ width: `${pct}%`, transition: "width 300ms ease" }}
-      />
-    </div>
-  );
-}
+const relTime = (ms) => {
+  const mins = Math.round((Date.now() - ms) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs} h ago`;
+  return `${Math.round(hrs / 24)} d ago`;
+};
 
 /* ---------------- Main App ---------------- */
 
-export default function CutCoachApp() {
+export default function CutCoachApp({ userId }) {
   const [tab, setTab] = useState("today");
   const [loading, setLoading] = useState(true);
   const [loadErr, setLoadErr] = useState("");
+  const [staleAt, setStaleAt] = useState(0);   // >0 => showing a cached ledger, network failed
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [days, setDays] = useState({});       // { "YYYY-MM-DD": { weight, meals:[{id,name,kcal,protein,carbs,fat}] } }
   const [workouts, setWorkouts] = useState([]); // [{ id, date, template, exercises, finisher }]
@@ -167,30 +101,86 @@ export default function CutCoachApp() {
   const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
+    const apply = (all) => {
+      setSettings(all.settings ? { ...DEFAULT_SETTINGS, ...all.settings } : DEFAULT_SETTINGS);
+      setDays(all.days || {});
+      setWorkouts(all.workouts || []);
+      setChat(all.chat || []);
+    };
+
+    // Paint the last snapshot immediately; the network pass below overwrites it.
+    const cached = readLedger(userId);
+    if (cached) {
+      apply(cached.data);
+      setLoading(false);
+    }
+
     (async () => {
       try {
         const all = await loadAll();
-        if (all.settings) {
-          setSettings({ ...DEFAULT_SETTINGS, ...all.settings });
-        } else {
-          setSettings(DEFAULT_SETTINGS);
-          saveProfile(DEFAULT_SETTINGS).catch(console.error);
-        }
-        setDays(all.days);
-        setWorkouts(all.workouts);
-        setChat(all.chat);
+        if (!all.settings) saveProfile(DEFAULT_SETTINGS).catch(console.error); // first run
+        apply(all);
+        writeLedger(userId, all);
         setLoadErr("");
+        setStaleAt(0);
       } catch (e) {
-        setLoadErr(e?.message || "load failed");
+        // Offline with something to show is a different story than a hard failure.
+        // Fall back to now, not to a truthy sentinel — a 0 here would render as
+        // "showing your ledger from 20900 d ago".
+        if (cached) setStaleAt(cached.at || Date.now());
+        else setLoadErr(e?.message || "load failed");
       }
       setLoading(false);
     })();
+  }, [userId]);
+
+  useEffect(() => {
+    // Cold start from a notification tap: /?tab=coach. Read in an effect rather than
+    // a useState initializer — client components still render on the server, where
+    // window doesn't exist.
+    const t = new URLSearchParams(window.location.search).get("tab");
+    if (TABS.includes(t)) setTab(t);
+
+    // Warm start: the SW focuses this window and posts instead of navigating.
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (e) => {
+      if (e.data && e.data.type === "NAVIGATE_TAB" && TABS.includes(e.data.tab)) setTab(e.data.tab);
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
   }, []);
+
+  useEffect(() => {
+    // Reconcile the push subscription on every open. iOS can evict one from an unused
+    // home-screen app without firing pushsubscriptionchange, and push then stops with
+    // no symptom. Also re-syncs the timezone after travel or a DST shift.
+    syncPushSubscription();
+  }, [userId]);
+
+  const signOut = async () => {
+    // Order matters: unsubscribing needs the JWT that signOut() destroys.
+    try {
+      await unsubscribePush();
+    } catch {
+      /* a dead subscription row is pruned on its next 410 */
+    }
+    try {
+      await getSupabase().auth.signOut();
+    } finally {
+      clearLedger(userId);
+    }
+  };
 
   const persistSettings = (next) => {
     setSettings(next);
     saveProfile(next).catch(console.error);
   };
+
+  // NotificationSettings writes to Supabase itself; this only mirrors the saved value
+  // into local state. Without it the card — which unmounts every time the settings
+  // sheet closes — would re-seed from a stale prop and show the previous toggles.
+  const rememberReminders = (timezone, reminders) =>
+    setSettings((s) => ({ ...s, timezone, reminders }));
 
   const logWeight = (date, weight) => {
     setDays((d) => ({ ...d, [date]: { ...(d[date] || { meals: [] }), weight } }));
@@ -256,12 +246,7 @@ export default function CutCoachApp() {
   const lastOfTemplate = (t) =>
     [...workouts].filter((w) => w.template === t).sort((a, b) => b.date.localeCompare(a.date))[0];
 
-  const suggestedTemplate = (() => {
-    if (!workouts.length) return "lowerA";
-    const last = [...workouts].sort((a, b) => a.date.localeCompare(b.date)).pop();
-    const idx = SEQUENCE.indexOf(last.template);
-    return SEQUENCE[(idx + 1) % SEQUENCE.length];
-  })();
+  const suggestedTemplate = nextTemplateFor(workouts);
 
   /* ---------- coach context ---------- */
 
@@ -331,10 +316,23 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100" style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
-      <div className="max-w-md mx-auto px-4 pt-6 pb-28">
+      <div
+        className="max-w-md mx-auto px-4"
+        style={{
+          // Grows to match the taller nav below, and clears the notch up top
+          // (statusBarStyle black-translucent puts us under the clock).
+          paddingTop: "calc(1.5rem + env(safe-area-inset-top))",
+          paddingBottom: "calc(7rem + env(safe-area-inset-bottom))",
+        }}
+      >
         {loadErr && (
           <div className="mb-3 text-xs text-rose-400">
             Couldn't load your data ({loadErr}). Refresh the page or sign in again.
+          </div>
+        )}
+        {!loadErr && staleAt > 0 && (
+          <div className="mb-3 text-xs text-slate-500">
+            Offline — showing your ledger from {relTime(staleAt)}. Anything you log now won't be saved.
           </div>
         )}
         {tab === "today" && (
@@ -346,6 +344,7 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
             suggestedTemplate={suggestedTemplate}
             goTrain={() => setTab("train")} goCoach={() => setTab("coach")}
             showSettings={showSettings} setShowSettings={setShowSettings}
+            signOut={signOut} saveReminders={rememberReminders}
           />
         )}
         {tab === "food" && (
@@ -371,7 +370,12 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
       </div>
 
       {/* Bottom navigation */}
-      <div className="fixed bottom-0 inset-x-0 border-t border-slate-800 bg-slate-950 bg-opacity-95 backdrop-blur">
+      {/* Inset goes on the fixed element, not the inner row — padding the inner div
+          would leave a transparent strip below the bar. No-op in a browser tab. */}
+      <div
+        className="fixed bottom-0 inset-x-0 border-t border-slate-800 bg-slate-950 bg-opacity-95 backdrop-blur"
+        style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+      >
         <div className="max-w-md mx-auto flex justify-between px-6 py-2">
           {[
             { id: "today", icon: Home, label: "Today" },
@@ -402,7 +406,7 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
 function TodayTab({
   settings, persistSettings, days, logWeight, kcalToday, protToday,
   currentAvg, weeklyRate, suggestedTemplate, goTrain, goCoach,
-  showSettings, setShowSettings,
+  showSettings, setShowSettings, signOut, saveReminders,
 }) {
   const tk = todayKey();
   const todaysWeight = days[tk] && days[tk].weight ? String(days[tk].weight) : "";
@@ -420,14 +424,8 @@ function TodayTab({
   const span = settings.targetWeight - settings.startWeight;
   const change = currentAvg != null ? currentAvg - settings.startWeight : 0;
   const pct = span !== 0 ? Math.max(0, Math.min(100, (change / span) * 100)) : 0;
-  const goodRate =
-    weeklyRate == null
-      ? true
-      : settings.phase === "bulk"
-      ? weeklyRate > 0
-      : settings.phase === "maintain"
-      ? Math.abs(weeklyRate) <= 0.25
-      : weeklyRate < 0;
+  // Shared with the notification copy so the two can't disagree about "on track".
+  const goodRate = onTrack(settings.phase, weeklyRate);
   const checkedInToday = settings.lastCheckin === tk;
   const sugg = PROGRAM[suggestedTemplate];
 
@@ -445,7 +443,15 @@ function TodayTab({
         </button>
       </div>
 
-      {showSettings && <SettingsPanel settings={settings} persistSettings={persistSettings} currentAvg={currentAvg} />}
+      {showSettings && (
+        <>
+          <SettingsPanel settings={settings} persistSettings={persistSettings} currentAvg={currentAvg} signOut={signOut} />
+          {/* Sibling card, deliberately not folded into SettingsPanel: that panel holds
+              its own draft state and save button, and mixing reminders into it would let
+              a reminders save rewrite phase/targets from stale in-memory values. */}
+          <NotificationSettings settings={settings} onSaved={saveReminders} />
+        </>
+      )}
 
       {/* Hero: the number that matters */}
       <Card className="border-amber-400 border-opacity-30">
@@ -540,7 +546,7 @@ function TodayTab({
   );
 }
 
-function SettingsPanel({ settings, persistSettings, currentAvg }) {
+function SettingsPanel({ settings, persistSettings, currentAvg, signOut }) {
   const [s, setS] = useState(settings);
   const upd = (k, v) => setS({ ...s, [k]: v });
 
@@ -605,7 +611,7 @@ function SettingsPanel({ settings, persistSettings, currentAvg }) {
         Save phase & targets
       </button>
       <button
-        onClick={() => getSupabase().auth.signOut()}
+        onClick={signOut}
         className="mt-2 w-full py-2 rounded-xl text-xs text-slate-500 border border-slate-800"
       >
         Sign out

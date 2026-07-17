@@ -1,0 +1,12 @@
+<!-- Source for public/icons/maskable-512.png and apple-touch-icon-180.png.
+     Full-bleed opaque square, glyph ~60% so it sits inside the maskable 80% safe circle.
+     Must stay opaque and square-cornered: iOS composites black behind alpha and
+     applies its own squircle; Android applies its own mask.
+     Regenerate with: npm run icons -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" fill="#020617"/>
+  <g fill="none" stroke="#fbbf24" stroke-width="30" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="103,179 202,279 279,202 410,333"/>
+    <polyline points="317,333 410,333 410,241"/>
+  </g>
+</svg>

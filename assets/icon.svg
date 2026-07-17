@@ -1,0 +1,10 @@
+<!-- Source for public/icons/icon-{32,192,512}.png — purpose:"any".
+     Rounded rect, alpha outside the corners, glyph ~70% of the canvas.
+     Regenerate with: npm run icons -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="114" fill="#020617"/>
+  <g fill="none" stroke="#fbbf24" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="77,167 193,283 283,193 435,346"/>
+    <polyline points="328,346 435,346 435,238"/>
+  </g>
+</svg>

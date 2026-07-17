@@ -1,0 +1,11 @@
+<!-- Source for public/icons/badge-72.png — Android's status-bar badge.
+     Must be monochrome-white on transparent: Android renders only the alpha
+     channel as a silhouette, so a full-colour icon with an opaque background
+     would show up as a featureless blob. Glyph ~80%, no background.
+     Regenerate with: npm run icons -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <g fill="none" stroke="#ffffff" stroke-width="41" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="51,154 184,287 287,184 461,358"/>
+    <polyline points="338,358 461,358 461,236"/>
+  </g>
+</svg>
