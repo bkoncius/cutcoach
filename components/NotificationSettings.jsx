@@ -71,6 +71,7 @@ export default function NotificationSettings({ settings, onSaved }) {
       storedTz: settings.timezone || "—",
       swController: typeof navigator !== "undefined" && !!navigator.serviceWorker?.controller,
       vapidKeySet: !!process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY,
+      buildId: process.env.NEXT_PUBLIC_BUILD_ID || "—",
       endpoint: "—",
     };
     try {
