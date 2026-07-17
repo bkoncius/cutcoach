@@ -1,23 +1,12 @@
-import { createClient } from "@supabase/supabase-js";
+import { requireUser } from "../../../lib/serverAuth";
 
 export const runtime = "nodejs";
 
 export async function POST(req) {
   try {
     // 1) Authenticate the caller with their Supabase JWT.
-    const authHeader = req.headers.get("authorization") || "";
-    const token = authHeader.replace(/^Bearer\s+/i, "");
-    if (!token) {
-      return Response.json({ error: { message: "Missing auth token" } }, { status: 401 });
-    }
-    const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-    );
-    const { data, error } = await supabase.auth.getUser(token);
-    if (error || !data?.user) {
-      return Response.json({ error: { message: "Unauthorized" } }, { status: 401 });
-    }
+    const { error: authError } = await requireUser(req);
+    if (authError) return authError;
 
     // 2) Forward to Anthropic with the server-held key.
     const body = await req.json();
