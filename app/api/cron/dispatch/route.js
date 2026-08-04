@@ -4,6 +4,7 @@ import { sendToUser } from "../../../../lib/push";
 import { nextTemplateFor } from "../../../../lib/program";
 import { REMINDERS, REMINDER_BY_ID, localParts, isDue } from "../../../../lib/reminders";
 import { computeTrend } from "../../../../lib/trend";
+import { runEngine, weekStartFor, ENGINE_WINDOW_DAYS } from "../../../../lib/engine";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -56,7 +57,9 @@ async function dispatch(req) {
   //    with real targets still gets its reminders.
   const { data: profiles, error: pErr } = await admin
     .from("profiles")
-    .select("user_id, timezone, reminders, phase, kcal_target, protein_target, last_checkin, units, sex, bodyfat_pct, experience")
+    .select(
+      "user_id, timezone, reminders, phase, kcal_target, protein_target, last_checkin, units, sex, bodyfat_pct, experience, birthdate, height_cm, activity_level, phase_started_at"
+    )
     .not("timezone", "is", null)
     .not("kcal_target", "is", null)
     .not("protein_target", "is", null);
@@ -66,14 +69,24 @@ async function dispatch(req) {
   if (sErr) return Response.json({ error: sErr.message }, { status: 500 });
   const hasDevice = new Set((subRows || []).map((r) => r.user_id));
 
-  // 2) Whose reminder window is open right now?
+  // 2) Whose reminder window is open right now? And whose weekly engine review is due?
+  //    The engine window is user-local Monday 06:00–06:30 — pure time math on rows we
+  //    already hold, evaluated BEFORE the reminders early-bail below so a tick with no
+  //    reminders due still runs reviews.
   const due = [];
+  const engineDue = [];
   for (const p of profiles || []) {
-    if (!hasDevice.has(p.user_id)) continue;
-    const prefs = p.reminders || {};
     const parts = localParts(now, p.timezone);
     if (!parts) continue; // unknown IANA zone
 
+    // Engine review needs no push subscription — the proposal card renders in-app
+    // either way; the push (below) is just the courtesy knock.
+    if (parts.date === weekStartFor(parts.date) && parts.minutes >= 360 && parts.minutes < 390) {
+      engineDue.push({ profile: p, local: parts });
+    }
+
+    if (!hasDevice.has(p.user_id)) continue;
+    const prefs = p.reminders || {};
     for (const r of REMINDERS) {
       const cfg = prefs[r.id];
       // Explicit opt-in only — never fall back to DEFAULT_REMINDERS here. Someone who
@@ -84,10 +97,15 @@ async function dispatch(req) {
     }
   }
 
+  const engineRan = await runWeeklyReviews(admin, engineDue, dry);
+
   // 3) 5-minute ticks mean ~288 invocations a day and only a handful do real work.
   //    Bail before touching meals/logs/workouts.
   if (due.length === 0) {
-    return Response.json({ ok: true, checked: (profiles || []).length, due: 0, sent: 0 });
+    return Response.json({
+      ok: true, checked: (profiles || []).length, due: 0, sent: 0,
+      engine: engineRan.length ? engineRan : undefined,
+    });
   }
 
   // 4) Bulk-fetch conditions for just the due users — not N queries per user.
@@ -168,7 +186,130 @@ async function dispatch(req) {
     due: due.length,
     sent: planned.filter((p) => p.sent).length,
     planned,
+    engine: engineRan.length ? engineRan : undefined,
   });
+}
+
+/* ---------------- the weekly engine tick ---------------- */
+
+/**
+ * For each user whose local clock is inside the Monday-morning window: claim the
+ * week's row FIRST (unique(user_id, week_start) — claim-then-work, exactly like
+ * notification_log), then fetch their data and run the deterministic engine. A
+ * duplicated or overlapping cron tick loses the claim insert and does nothing.
+ */
+async function runWeeklyReviews(admin, engineDue, dry) {
+  const results = [];
+  for (const { profile: p, local } of engineDue) {
+    const weekStart = weekStartFor(local.date);
+    const tag = { user: short(p.user_id), week: weekStart };
+
+    if (dry) {
+      results.push({ ...tag, would: "run weekly review" });
+      continue;
+    }
+
+    // The claim. 23505 = someone (an overlapping tick, or the grace window's
+    // next 5-min invocation) already has this week.
+    const { data: claim, error: cErr } = await admin
+      .from("engine_proposals")
+      .insert({ user_id: p.user_id, week_start: weekStart, status: "none", proposal: {} })
+      .select("id");
+    if (cErr) {
+      if (cErr.code !== "23505") results.push({ ...tag, error: cErr.message });
+      continue; // already claimed — normal
+    }
+    const rowId = claim[0].id;
+
+    try {
+      const from = shiftDate(local.date, -(ENGINE_WINDOW_DAYS + 14)); // slack for the trend seed
+      const [logsRes, mealsRes, prevRes, histRes] = await Promise.all([
+        admin.from("daily_logs").select("date, weight, intake_complete").eq("user_id", p.user_id).gte("date", from),
+        admin.from("meals").select("date, kcal").eq("user_id", p.user_id).gte("date", from),
+        admin
+          .from("engine_proposals")
+          .select("proposal")
+          .eq("user_id", p.user_id)
+          .eq("week_start", shiftDate(weekStart, -7))
+          .maybeSingle(),
+        admin
+          .from("target_history")
+          .select("created_at, context, source")
+          .eq("user_id", p.user_id)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ]);
+
+      const kcalByDate = {};
+      for (const m of mealsRes.data || []) kcalByDate[m.date] = (kcalByDate[m.date] || 0) + (Number(m.kcal) || 0);
+      const completeByDate = {};
+      for (const l of logsRes.data || []) completeByDate[l.date] = !!l.intake_complete;
+      const intake = Object.keys(kcalByDate).map((date) => ({
+        date,
+        kcal: kcalByDate[date],
+        complete: !!completeByDate[date],
+      }));
+
+      const prevVerdict = prevRes.data?.proposal?.basis?.verdict || prevRes.data?.proposal?.verdict || null;
+      const hist = histRes.data || null;
+
+      const out = runEngine({
+        weights: (logsRes.data || []).map((l) => ({ date: l.date, weight: l.weight })),
+        intake,
+        profile: {
+          sex: p.sex,
+          birthdate: p.birthdate,
+          heightCm: p.height_cm != null ? Number(p.height_cm) : null,
+          activityLevel: p.activity_level,
+          bodyfatPct: p.bodyfat_pct != null ? Number(p.bodyfat_pct) : null,
+          experience: p.experience,
+        },
+        targets: {
+          kcal: p.kcal_target,
+          protein: p.protein_target,
+          phase: p.phase || "cut",
+          phaseStartedAt: p.phase_started_at,
+          proteinSetAtWeight: hist?.context?.trendWeight ?? hist?.context?.weightKg ?? null,
+        },
+        prevWeekOutOfBand: prevVerdict != null && prevVerdict !== "in_lane" && prevVerdict !== "unknown",
+        lastAppliedAt: hist && (hist.source === "manual" || hist.source === "engine") ? String(hist.created_at).slice(0, 10) : null,
+        asOf: local.date,
+      });
+
+      const basis = {
+        verdict: out.verdict,
+        trendWeight: out.trendWeight,
+        rate: out.rate,
+        tdeeFormula: out.tdeeFormula,
+        tdeeAdaptive: out.tdeeAdaptive,
+        tdeeBlended: out.tdeeBlended,
+        blendWeight: out.blendWeight,
+        completeDays: out.completeDays,
+        weighIns: out.weighIns,
+        spanDays: out.spanDays,
+        kcalAtEval: p.kcal_target,
+        proteinAtEval: p.protein_target,
+        confidence: out.confidence,
+      };
+      const payload = out.proposal
+        ? { ...out.proposal, verdict: out.verdict, confidence: out.confidence, basis }
+        : { holdReason: out.holdReason, verdict: out.verdict, confidence: out.confidence, basis };
+
+      await admin
+        .from("engine_proposals")
+        .update({ status: out.proposal ? "pending" : "none", proposal: payload })
+        .eq("id", rowId);
+
+      results.push({ ...tag, status: out.proposal ? "pending" : "none", verdict: out.verdict });
+    } catch (e) {
+      // Release the claim so the NEXT Monday tick inside the grace window can retry —
+      // a transient failure must not burn the whole week.
+      await admin.from("engine_proposals").delete().eq("id", rowId);
+      results.push({ ...tag, error: e?.message || "engine failed" });
+    }
+  }
+  return results;
 }
 
 const short = (id) => `${String(id).slice(0, 8)}…`;
@@ -188,17 +329,25 @@ async function buildContexts(admin, dateByUser, profileByUser) {
   // 21 days back gives the 14-day trend window slack for missed days.
   const from = shiftDate(minDate, -21);
 
-  const [logsRes, mealsRes, workoutsRes] = await Promise.all([
+  const [logsRes, mealsRes, workoutsRes, proposalsRes] = await Promise.all([
     admin.from("daily_logs").select("user_id, date, weight").in("user_id", userIds).gte("date", from),
     admin.from("meals").select("user_id, date, kcal, protein").in("user_id", userIds).in("date", dates),
     admin.from("workouts").select("user_id, date, template, exercises").in("user_id", userIds).gte("date", from),
+    // Current-week pending proposals feed the weekly_review reminder copy.
+    admin.from("engine_proposals").select("user_id, week_start, status, proposal").in("user_id", userIds).eq("status", "pending"),
   ]);
 
   const byUser = {};
-  for (const id of userIds) byUser[id] = { logs: [], meals: [], workouts: [], profile: profileByUser[id] || null };
+  for (const id of userIds) byUser[id] = { logs: [], meals: [], workouts: [], profile: profileByUser[id] || null, pending: null };
   for (const r of logsRes.data || []) byUser[r.user_id]?.logs.push(r);
   for (const r of mealsRes.data || []) byUser[r.user_id]?.meals.push(r);
   for (const r of workoutsRes.data || []) byUser[r.user_id]?.workouts.push(r);
+  for (const r of proposalsRes.data || []) {
+    const u = byUser[r.user_id];
+    // Only the current local week's pending row counts — stale pendings from a lapsed
+    // week shouldn't re-knock forever.
+    if (u && r.week_start === weekStartFor(dateByUser[r.user_id])) u.pending = r.proposal;
+  }
 
   const out = {};
   for (const id of userIds) out[id] = contextFor(byUser[id], dateByUser[id]);
@@ -250,6 +399,8 @@ function contextFor(u, date) {
     daysSinceWorkout: lastWorkout ? daysBetween(lastWorkout.date, date) : null,
     nextTemplate: nextTemplateFor(workoutsSorted),
     lastMainLift: heaviestSet(lastWorkout),
+
+    pendingProposal: u.pending || null,
   };
 }
 

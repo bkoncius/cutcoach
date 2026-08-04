@@ -33,7 +33,8 @@ that justified it.
    `supabase/schema.sql` → **Run**. This creates all tables with row-level security.
 3. Same again with `supabase/002_push.sql` (notification tables + profile columns),
    then `supabase/004_identity.sql` (client identity columns, target history, and the
-   removal of the one-size-fits-all target defaults). Both are safe to re-run;
+   removal of the one-size-fits-all target defaults), then `supabase/005_engine.sql`
+   (the day-complete flag + weekly review proposals). All safe to re-run;
    `schema.sql` is not.
 4. **Authentication → Providers → Email**: make sure Email is enabled.
    Optional for solo use: turn OFF "Confirm email" so sign-up works instantly.
@@ -200,6 +201,35 @@ supabase/schema.sql          tables + RLS (run once)
 supabase/002_push.sql        push tables + profile columns (re-runnable)
 supabase/003_cron.sql        pg_cron schedule (edit placeholders first)
 ```
+
+## How the adaptive calorie engine works
+
+Every Monday morning (06:00–06:30 in *your* timezone — the 5-minute cron the reminders
+already ride), the dispatcher runs `lib/engine.js` per user:
+
+1. **Measured burn**: mean intake over fully-logged days minus what the 21-day trend
+   says you banked (`7700 kcal/kg`). Gated behind ≥8 complete days and ≥6 weigh-ins
+   spanning ≥14 days — below that, an energy-balance TDEE is noise dressed as science.
+2. **Blend**: measured burn is confidence-weighted against the Mifflin-St Jeor formula
+   (0% data → pure formula; 14 complete days across 3 weeks → pure measurement).
+3. **Verdict**: your trend rate vs the phase lane (`lib/lanes.js`).
+4. **Proposal**: a kcal step sized to point the trend back at mid-lane, capped at
+   ±200/week (deliberate under-correction — consecutive weeks converge), floored at
+   1500 M / 1200 F and 75% of burn. Protein rescales when bodyweight has moved ≥2.5 kg.
+5. **Guards**: no proposals in a phase's first 14 days, within a week of any target
+   change, on low-confidence trends, or — the death-spiral blocker — when logged intake
+   can't plausibly explain the trend (under-logging gets called out instead of "eat less").
+
+The result lands in `engine_proposals` (one row per user-week, claimed via a unique
+index so duplicate cron ticks are harmless). **Nothing applies automatically**: a card
+on the Today tab shows the numbers and the reason; you tap Apply. The `weekly_review`
+reminder (default 08:00 Monday) knocks only when a proposal is actually pending. Weeks
+with nothing to change are recorded too (`status: none` with the hold reason), so the
+coach can say "reviewed, you're in the lane" instead of going quiet.
+
+"Fully logged" is an explicit tap on the Food tab (today or yesterday) — deliberately
+not a heuristic, because a meals-count guess misreads both fasting days and grazing
+days, and the whole engine stands on that flag being honest.
 
 ## How reminders work
 `lib/reminders.js` is the single source of truth — the settings UI and the cron

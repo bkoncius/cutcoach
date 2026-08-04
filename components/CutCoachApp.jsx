@@ -20,18 +20,21 @@ import {
   addChatMessage,
   recordTargetChange,
   stampPhaseStart,
+  markDayComplete,
 } from "../lib/db";
 import { getSupabase } from "../lib/supabaseClient";
 import { read as readLedger, write as writeLedger, clear as clearLedger } from "../lib/ledgerCache";
 import { syncPushSubscription, unsubscribePush } from "../lib/pushClient";
 import { PROGRAM, SEQUENCE, nextTemplateFor } from "../lib/program";
 import { computeTrend, trendSeries } from "../lib/trend";
+import { runEngine } from "../lib/engine";
 import { laneVerdict, laneText, laneRules, weeksInLane } from "../lib/lanes";
 import { formatWeight, weightUnit, parseWeightInput, validWeightKg, kgToLb } from "../lib/units";
 import { ageFrom, suggestTargets, checkGoal } from "../lib/calc";
 import NotificationSettings from "./NotificationSettings";
 import Onboarding from "./Onboarding";
 import ProfileCard from "./ProfileCard";
+import ProposalCard from "./ProposalCard";
 import { Card, Eyebrow, Bar } from "./ui";
 
 const APP_VERSION = "3.1";
@@ -106,6 +109,7 @@ export default function CutCoachApp({ userId }) {
   const [days, setDays] = useState({});       // { "YYYY-MM-DD": { weight, meals:[{id,name,kcal,protein,carbs,fat}] } }
   const [workouts, setWorkouts] = useState([]); // [{ id, date, template, exercises, finisher }]
   const [chat, setChat] = useState([]);        // [{ role, content }]
+  const [proposal, setProposal] = useState(null); // latest engine_proposals row
   const [active, setActive] = useState(null);  // active workout session
   const [showSettings, setShowSettings] = useState(false);
 
@@ -115,6 +119,7 @@ export default function CutCoachApp({ userId }) {
       setDays(all.days || {});
       setWorkouts(all.workouts || []);
       setChat(all.chat || []);
+      setProposal(all.proposal || null);
     };
 
     // Paint the last snapshot immediately; the network pass below overwrites it.
@@ -207,6 +212,13 @@ export default function CutCoachApp({ userId }) {
         meals: [...(((d[date] || {}).meals) || []), { ...meal, id }],
       },
     }));
+  };
+
+  // The engine's data-quality bit: only days explicitly marked complete feed the
+  // adaptive TDEE. Optimistic like logWeight.
+  const setDayComplete = (date, complete) => {
+    setDays((d) => ({ ...d, [date]: { ...(d[date] || { meals: [] }), intakeComplete: complete } }));
+    markDayComplete(date, complete).catch(console.error);
   };
 
   const deleteMealFn = (date, id) => {
@@ -416,11 +428,20 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
             goTrain={() => setTab("train")} goCoach={() => setTab("coach")}
             showSettings={showSettings} setShowSettings={setShowSettings}
             signOut={signOut} saveReminders={rememberReminders} saveIdentityLocal={rememberIdentity}
+            proposal={proposal}
+            onProposalApplied={(res, p) => {
+              if (!res.alreadyActed) {
+                setSettings((s) => ({ ...s, kcalTarget: res.newKcal, proteinTarget: res.newProtein }));
+              }
+              setProposal((r) => (r ? { ...r, status: "applied" } : r));
+            }}
+            onProposalDismissed={() => setProposal((r) => (r ? { ...r, status: "dismissed" } : r))}
           />
         )}
         {tab === "food" && (
           <FoodTab days={days} addMeal={addMealFn} deleteMeal={deleteMealFn}
-            settings={settings} kcalToday={kcalToday} protToday={protToday} />
+            settings={settings} kcalToday={kcalToday} protToday={protToday}
+            setDayComplete={setDayComplete} />
         )}
         {tab === "train" && (
           <TrainTab
@@ -478,6 +499,7 @@ function TodayTab({
   settings, persistSettings, days, logWeight, kcalToday, protToday,
   trendState, weightEntries, suggestedTemplate, goTrain, goCoach,
   showSettings, setShowSettings, signOut, saveReminders, saveIdentityLocal,
+  proposal, onProposalApplied, onProposalDismissed,
 }) {
   const tk = todayKey();
   const units = settings.units || "metric";
@@ -558,6 +580,10 @@ function TodayTab({
           <NotificationSettings settings={settings} onSaved={saveReminders} />
         </>
       )}
+
+      {/* The engine's weekly review, while pending. Deliberately ABOVE the hero:
+          when the plan wants an update, that's the day's most important card. */}
+      <ProposalCard row={proposal} settings={settings} onApplied={onProposalApplied} onDismissed={onProposalDismissed} />
 
       {/* Hero: the number that matters */}
       <Card className="border-amber-400 border-opacity-30">
@@ -835,9 +861,14 @@ function TargetField({ label, value, onChange }) {
 
 /* ---------------- Food ---------------- */
 
-function FoodTab({ days, addMeal: addMealDb, deleteMeal: deleteMealDb, settings, kcalToday, protToday }) {
+function FoodTab({ days, addMeal: addMealDb, deleteMeal: deleteMealDb, settings, kcalToday, protToday, setDayComplete }) {
   const tk = todayKey();
   const meals = (days[tk] && days[tk].meals) || [];
+  const yk = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
   const carbsToday = meals.reduce((s, m) => s + (Number(m.carbs) || 0), 0);
   const fatToday = meals.reduce((s, m) => s + (Number(m.fat) || 0), 0);
   const [desc, setDesc] = useState("");
@@ -1190,6 +1221,40 @@ function FoodTab({ days, addMeal: addMealDb, deleteMeal: deleteMealDb, settings,
           </div>
         </Card>
       )}
+
+      {/* The adaptive engine's data-quality bit. Only days marked complete feed the
+          measured-TDEE calculation — an unmarked day is treated as unknown, never as
+          "ate nothing". Yesterday stays editable because most people notice at
+          breakfast that they forgot. */}
+      <Card>
+        <Eyebrow>Fully logged?</Eyebrow>
+        <div className="text-xs text-slate-500 mt-1 leading-relaxed">
+          Mark a day once everything you ate is in. Your weekly calorie review only
+          trusts complete days.
+        </div>
+        <div className="mt-3 space-y-2">
+          {[
+            { key: tk, label: "Today" },
+            { key: yk, label: "Yesterday" },
+          ].map(({ key, label }) => {
+            const done = !!(days[key] && days[key].intakeComplete);
+            return (
+              <button
+                key={key}
+                onClick={() => setDayComplete(key, !done)}
+                className={`w-full flex items-center justify-between rounded-xl border px-4 py-2.5 text-sm ${
+                  done ? "border-teal-400 border-opacity-40 bg-slate-800" : "border-slate-700 bg-slate-900"
+                }`}
+              >
+                <span className={done ? "text-slate-200" : "text-slate-400"}>{label}</span>
+                <span className={`flex items-center gap-1 text-xs font-semibold ${done ? "text-teal-400" : "text-slate-600"}`}>
+                  {done ? (<><Check size={14} /> complete</>) : "mark complete"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </Card>
     </div>
   );
 }
@@ -1422,6 +1487,35 @@ function TrendTab({ chartData, settings, trendState, days }) {
   const goalY = units === "imperial" ? kgToLb(settings.targetWeight) : settings.targetWeight;
   const currentAvg = trendState.trendWeight;
   const weeklyRate = trendState.rate;
+
+  // Read-only client run of the SAME engine module the Monday dispatcher uses —
+  // live tiles here, authored proposals there, one implementation.
+  const engineView = runEngine({
+    weights: Object.entries(days)
+      .filter(([, v]) => v && v.weight != null)
+      .map(([date, v]) => ({ date, weight: Number(v.weight) })),
+    intake: Object.entries(days).map(([date, v]) => ({
+      date,
+      kcal: ((v && v.meals) || []).reduce((s, m) => s + (Number(m.kcal) || 0), 0),
+      complete: !!(v && v.intakeComplete),
+    })),
+    profile: {
+      sex: settings.sex,
+      birthdate: settings.birthdate,
+      heightCm: settings.heightCm,
+      activityLevel: settings.activityLevel,
+      bodyfatPct: settings.bodyfatPct,
+      experience: settings.experience,
+    },
+    targets: {
+      kcal: settings.kcalTarget,
+      protein: settings.proteinTarget,
+      phase: settings.phase,
+      phaseStartedAt: settings.phaseStartedAt,
+      proteinSetAtWeight: null, // tiles don't propose; protein rescale is the server's job
+    },
+    asOf: todayKey(),
+  });
   const change = currentAvg != null ? currentAvg - settings.startWeight : null;
   const remaining = currentAvg != null ? settings.targetWeight - currentAvg : null;
   // Only project an arrival when the rate is trustworthy — a low-confidence slope
@@ -1512,6 +1606,16 @@ function TrendTab({ chartData, settings, trendState, days }) {
           unit="kcal"
         />
         <Stat label={`Avg protein (${loggedDays.length}/7 logged)`} value={avgProt} unit="g" />
+        <Stat
+          label={
+            engineView.blendWeight > 0
+              ? `Est. burn (${Math.round(engineView.blendWeight * 100)}% measured)`
+              : "Est. burn (formula)"
+          }
+          value={engineView.tdeeBlended}
+          unit="kcal"
+        />
+        <Stat label="Complete days (21d)" value={engineView.completeDays} unit={`/ ${21}`} />
       </div>
 
       {/* Generated from lib/lanes.js with the actual bodyweight — the same numbers the
