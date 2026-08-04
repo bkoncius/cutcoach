@@ -23,7 +23,8 @@ import { getSupabase } from "../lib/supabaseClient";
 import { read as readLedger, write as writeLedger, clear as clearLedger } from "../lib/ledgerCache";
 import { syncPushSubscription, unsubscribePush } from "../lib/pushClient";
 import { PROGRAM, SEQUENCE, nextTemplateFor } from "../lib/program";
-import { onTrack } from "../lib/reminders";
+import { computeTrend, trendSeries } from "../lib/trend";
+import { laneVerdict, laneText, laneRules, weeksInLane } from "../lib/lanes";
 import NotificationSettings from "./NotificationSettings";
 import { Card, Eyebrow, Bar } from "./ui";
 
@@ -42,28 +43,14 @@ const DEFAULT_SETTINGS = {
   reminders: {},
 };
 
+// Lane prose no longer lives here — it's GENERATED from lib/lanes.js with the user's
+// actual bodyweight (laneText for display, laneRules for the coach prompt), so the
+// text can never contradict the verdict code again. `suggest` presets die in the
+// onboarding phase, replaced by lib/calc.js.
 const PHASES = {
-  cut: {
-    label: "Cut",
-    title: "The Cut",
-    suggest: { kcal: 2200, protein: 175, deltaKg: -12 },
-    lane: "Healthy lane: −0.5 to −0.7 kg/week on the 7-day average. Slower for 2–3 weeks → tighten intake ~150–200 kcal. Faster than −1.0 → eat a bit more; the muscle is the point.",
-    rules: "Phase: CUT. Lane: −0.5 to −0.7 kg/week. Slower than −0.35 for 2–3 weeks → advise −150–200 kcal or one extra Zone-2 session. Faster than −1.0 → advise +150 kcal to protect muscle. Protein is the non-negotiable target. Maintaining lifting loads counts as winning.",
-  },
-  maintain: {
-    label: "Maintain",
-    title: "Maintenance",
-    suggest: { kcal: 2750, protein: 160, deltaKg: 0 },
-    lane: "Lane: hold within ±0.3 kg/week on the 7-day average while pushing your lifts. Drifting for 2+ weeks → nudge intake 100–150 kcal.",
-    rules: "Phase: MAINTENANCE. Lane: hold within ±0.25 kg/week. Drifting 2+ weeks → advise ±100–150 kcal. Primary goal: push lift progression at stable bodyweight and consolidate habits.",
-  },
-  bulk: {
-    label: "Bulk",
-    title: "The Bulk",
-    suggest: { kcal: 3050, protein: 170, deltaKg: 5 },
-    lane: "Lean-gain lane: +0.2 to +0.35 kg/week on the 7-day average. Flat for 2–3 weeks → add ~100–150 kcal. Faster than +0.5 → trim ~150 kcal; excess speed is mostly fat.",
-    rules: "Phase: LEAN BULK. Lane: +0.2 to +0.35 kg/week. Flat for 2–3 weeks → advise +100–150 kcal. Faster than +0.5/week → advise −150 kcal since the excess is mostly fat. Primary goal: progressive overload — expect load or rep increases on main lifts most weeks. Protein stays high.",
-  },
+  cut: { label: "Cut", title: "The Cut", suggest: { kcal: 2200, protein: 175, deltaKg: -12 } },
+  maintain: { label: "Maintain", title: "Maintenance", suggest: { kcal: 2750, protein: 160, deltaKg: 0 } },
+  bulk: { label: "Bulk", title: "The Bulk", suggest: { kcal: 3050, protein: 170, deltaKg: 5 } },
 };
 
 /* ---------------- Helpers ---------------- */
@@ -223,25 +210,23 @@ export default function CutCoachApp({ userId }) {
   const kcalToday = (today.meals || []).reduce((s, m) => s + (Number(m.kcal) || 0), 0);
   const protToday = (today.meals || []).reduce((s, m) => s + (Number(m.protein) || 0), 0);
 
+  // All trend math lives in lib/trend.js — one shared implementation with the cron
+  // dispatcher, calendar-windowed so sparse logging can't inflate the rate (the old
+  // slice(-7) entry-windowing overstated an every-other-day logger's rate ~2×).
   const weightSeries = Object.entries(days)
-    .filter(([, v]) => v && v.weight)
+    .filter(([, v]) => v && v.weight != null)
     .map(([date, v]) => ({ date, weight: Number(v.weight) }))
     .sort((a, b) => a.date.localeCompare(b.date));
 
-  const chartData = weightSeries.map((e, i) => {
-    const win = weightSeries.slice(Math.max(0, i - 6), i + 1);
-    const avg = win.reduce((s, x) => s + x.weight, 0) / win.length;
-    return { label: shortDate(e.date), weight: e.weight, avg: +avg.toFixed(2) };
-  });
+  const chartData = trendSeries(weightSeries).map((e) => ({
+    label: shortDate(e.date),
+    weight: e.weight,
+    avg: e.trend, // chart line keeps its dataKey; the value is now the EWMA trend
+  }));
 
-  const currentAvg = chartData.length ? chartData[chartData.length - 1].avg : null;
-  const last7 = weightSeries.slice(-7);
-  const prev7 = weightSeries.slice(-14, -7);
-  const weeklyRate =
-    last7.length >= 3 && prev7.length >= 3
-      ? last7.reduce((s, x) => s + x.weight, 0) / last7.length -
-        prev7.reduce((s, x) => s + x.weight, 0) / prev7.length
-      : null;
+  const trendState = computeTrend(weightSeries, tk);
+  const currentAvg = trendState.trendWeight;
+  const weeklyRate = trendState.rate;
 
   const lastOfTemplate = (t) =>
     [...workouts].filter((w) => w.template === t).sort((a, b) => b.date.localeCompare(a.date))[0];
@@ -251,7 +236,6 @@ export default function CutCoachApp({ userId }) {
   /* ---------- coach context ---------- */
 
   const buildContext = () => {
-    const phase = PHASES[settings.phase] || PHASES.cut;
     const workoutByDate = {};
     workouts.forEach((w) => { workoutByDate[w.date] = PROGRAM[w.template].name; });
 
@@ -290,10 +274,19 @@ export default function CutCoachApp({ userId }) {
       return `${shortDate(w.date)} ${PROGRAM[w.template].name}${w.finisher ? " +cardio" : ""} — ${ex || "logged"}`;
     });
 
+    // Lane rules are GENERATED from lib/lanes.js with the user's actual weight — the
+    // same numbers the badge and notifications check, so prompt and UI can't drift.
+    const rules = laneRules(settings.phase, currentAvg ?? weightSeries[weightSeries.length - 1]?.weight, {});
+    const trendLine =
+      currentAvg != null
+        ? `Current trend weight ${fmt1(currentAvg)} kg${weeklyRate != null ? `, moving ${weeklyRate > 0 ? "+" : ""}${weeklyRate.toFixed(2)} kg/week` : " (not enough weigh-ins yet for a rate)"}.`
+        : "No weigh-ins yet.";
+
     return `You are the built-in AI coach in Benas's personal training & nutrition app. Profile: male, 29, 182 cm. Phase start weight ${settings.startWeight} kg, phase goal ${settings.targetWeight} kg. Program: 4-day upper/lower split (Lower A squat, Upper A bench, Lower B deadlift, Upper B overhead) with Zone-2/interval finishers, ~2 yrs lifting experience, full gym.
 Daily targets: ${settings.kcalTarget} kcal, ${settings.proteinTarget} g protein.
-${phase.rules}
-Universal rules: judge weight by the 7-day average only. Flag 2+ missing logging days honestly. Suggest a deload every 5–6 weeks of hard training.
+${trendLine}
+${rules}
+Universal rules: judge weight by the trend weight only, never single days. Flag 2+ missing logging days honestly. Suggest a deload every 5–6 weeks of hard training.
 Style: thorough and specific — reference actual numbers from the data. For check-ins cover: weight trajectory vs the phase lane; calorie and protein adherence; macro balance, including carb placement on training vs rest days and fat consistency; lift-by-lift progression; then one concrete priority for today and any target adjustment per the phase rules. 250–400 words for check-ins, shorter for quick questions. Plain text only — no markdown, no asterisks, no headers, no bullet symbols. Short paragraphs.
 
 DATA — last 14 days (weight, intake, training):
@@ -340,7 +333,7 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
             settings={settings} persistSettings={persistSettings}
             days={days} logWeight={logWeight}
             kcalToday={kcalToday} protToday={protToday}
-            currentAvg={currentAvg} weeklyRate={weeklyRate}
+            trendState={trendState} weightEntries={weightSeries}
             suggestedTemplate={suggestedTemplate}
             goTrain={() => setTab("train")} goCoach={() => setTab("coach")}
             showSettings={showSettings} setShowSettings={setShowSettings}
@@ -360,7 +353,7 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
         )}
         {tab === "trend" && (
           <TrendTab chartData={chartData} settings={settings}
-            currentAvg={currentAvg} weeklyRate={weeklyRate} days={days} />
+            trendState={trendState} days={days} />
         )}
         {tab === "coach" && (
           <CoachTab chat={chat} persistChat={persistChat}
@@ -405,13 +398,23 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
 
 function TodayTab({
   settings, persistSettings, days, logWeight, kcalToday, protToday,
-  currentAvg, weeklyRate, suggestedTemplate, goTrain, goCoach,
+  trendState, weightEntries, suggestedTemplate, goTrain, goCoach,
   showSettings, setShowSettings, signOut, saveReminders,
 }) {
   const tk = todayKey();
-  const todaysWeight = days[tk] && days[tk].weight ? String(days[tk].weight) : "";
+  const todaysWeight = days[tk] && days[tk].weight != null ? String(days[tk].weight) : "";
   const [w, setW] = useState(todaysWeight);
   const [savedFlash, setSavedFlash] = useState(false);
+
+  // Cached-then-network hydration can change today's stored weight after mount. Sync
+  // the draft only while the user hasn't typed — never clobber mid-edit.
+  const lastSynced = useRef(todaysWeight);
+  useEffect(() => {
+    if (todaysWeight !== lastSynced.current) {
+      if (w === lastSynced.current) setW(todaysWeight);
+      lastSynced.current = todaysWeight;
+    }
+  }, [todaysWeight, w]);
 
   const saveWeight = () => {
     const val = parseFloat(String(w).replace(",", "."));
@@ -421,11 +424,29 @@ function TodayTab({
     setTimeout(() => setSavedFlash(false), 1200);
   };
 
+  const currentAvg = trendState.trendWeight;
+  const weeklyRate = trendState.rate;
+  const lowConf = trendState.confidence === "low";
+  // Same module the notifications and coach prompt use — they cannot disagree.
+  const verdict = laneVerdict(settings.phase, weeklyRate, currentAvg, {});
+  const goodRate = verdict === "in_lane" || verdict === "unknown";
+
+  const isMaintain = (settings.phase || "cut") === "maintain";
   const span = settings.targetWeight - settings.startWeight;
   const change = currentAvg != null ? currentAvg - settings.startWeight : 0;
-  const pct = span !== 0 ? Math.max(0, Math.min(100, (change / span) * 100)) : 0;
-  // Shared with the notification copy so the two can't disagree about "on track".
-  const goodRate = onTrack(settings.phase, weeklyRate);
+  const rawPct = span !== 0 ? (change / span) * 100 : 0;
+  const wrongDirection = !isMaintain && currentAvg != null && rawPct < -0.5;
+  const pct = Math.max(0, Math.min(100, rawPct));
+
+  // Maintenance has no start→goal distance to fill; show position inside the ±1%
+  // hold band plus how long the trend has stayed in lane.
+  const band = settings.startWeight * 0.01;
+  const gaugePct =
+    isMaintain && currentAvg != null && band > 0
+      ? Math.max(0, Math.min(100, ((currentAvg - (settings.startWeight - band)) / (2 * band)) * 100))
+      : 50;
+  const inLaneWeeks = isMaintain ? weeksInLane(weightEntries, tk, "maintain", {}) : 0;
+
   const checkedInToday = settings.lastCheckin === tk;
   const sugg = PROGRAM[suggestedTemplate];
 
@@ -455,7 +476,7 @@ function TodayTab({
 
       {/* Hero: the number that matters */}
       <Card className="border-amber-400 border-opacity-30">
-        <Eyebrow color="text-amber-400">7-day average — the number that matters</Eyebrow>
+        <Eyebrow color="text-amber-400">Trend weight — the number that matters</Eyebrow>
         <div className="flex items-end gap-3 mt-2">
           <div className="font-mono text-5xl font-bold tracking-tight">
             {currentAvg != null ? fmt1(currentAvg) : "—"}
@@ -465,20 +486,55 @@ function TodayTab({
             <div className={`ml-auto mb-1 font-mono text-sm px-2 py-1 rounded-lg ${
               goodRate ? "bg-slate-800 text-teal-300" : "bg-slate-800 text-rose-300"
             }`}>
-              {weeklyRate > 0 ? "+" : ""}{fmt1(weeklyRate)} kg/wk
+              {lowConf ? "~" : ""}{weeklyRate > 0 ? "+" : ""}{fmt1(weeklyRate)} kg/wk
+              {verdict === "slow" ? " · slow" : verdict === "fast" ? " · fast" : ""}
             </div>
           )}
         </div>
-        <div className="mt-4">
-          <div className="flex justify-between text-xs font-mono text-slate-500 mb-1">
-            <span>{fmt1(settings.startWeight)}</span>
-            <span className="text-slate-300">{change > 0 ? "+" : ""}{fmt1(change)} kg · {Math.round(pct)}%</span>
-            <span>{fmt1(settings.targetWeight)}</span>
+        {weeklyRate == null && (
+          <div className="text-xs text-slate-500 mt-1">
+            {trendState.nPoints === 0
+              ? "Log your first weigh-in to start the trend."
+              : trendState.pointsNeeded > 0
+              ? `${trendState.pointsNeeded} more weigh-in${trendState.pointsNeeded === 1 ? "" : "s"} until your trend appears.`
+              : "A few more days of weigh-ins until your trend appears."}
           </div>
-          <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
-            <div className="h-full rounded-full bg-amber-400" style={{ width: `${pct}%` }} />
+        )}
+        {isMaintain ? (
+          /* Maintenance: a start→goal bar is meaningless (start === goal). Show
+             position inside the ±1% hold band and how long the trend has held it. */
+          <div className="mt-4">
+            <div className="flex justify-between text-xs font-mono text-slate-500 mb-1">
+              <span>{fmt1(settings.startWeight - band)}</span>
+              <span className="text-slate-300">
+                {inLaneWeeks > 0 ? `${inLaneWeeks} wk${inLaneWeeks === 1 ? "" : "s"} in lane` : "hold the line"}
+              </span>
+              <span>{fmt1(settings.startWeight + band)}</span>
+            </div>
+            <div className="relative h-2 rounded-full bg-slate-800">
+              <div className="absolute inset-y-0 left-1/2 w-px bg-slate-600" />
+              <div
+                className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 h-3 w-3 rounded-full ${
+                  goodRate ? "bg-teal-400" : "bg-rose-400"
+                }`}
+                style={{ left: `${gaugePct}%` }}
+              />
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="mt-4">
+            <div className="flex justify-between text-xs font-mono text-slate-500 mb-1">
+              <span>{fmt1(settings.startWeight)}</span>
+              <span className={wrongDirection ? "text-rose-400" : "text-slate-300"}>
+                {change > 0 ? "+" : ""}{fmt1(change)} kg · {wrongDirection ? "wrong way" : `${Math.round(pct)}%`}
+              </span>
+              <span>{fmt1(settings.targetWeight)}</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+              <div className="h-full rounded-full bg-amber-400" style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        )}
       </Card>
 
       {/* Morning weigh-in */}
@@ -1217,13 +1273,23 @@ function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
 
 /* ---------------- Trend ---------------- */
 
-function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
+function TrendTab({ chartData, settings, trendState, days }) {
+  const currentAvg = trendState.trendWeight;
+  const weeklyRate = trendState.rate;
   const change = currentAvg != null ? currentAvg - settings.startWeight : null;
   const remaining = currentAvg != null ? settings.targetWeight - currentAvg : null;
+  // Only project an arrival when the rate is trustworthy — a low-confidence slope
+  // extrapolated over months is a lie with a date on it.
   const eta =
-    remaining != null && weeklyRate != null && Math.abs(weeklyRate) > 0.05 && remaining / weeklyRate > 0
+    remaining != null &&
+    weeklyRate != null &&
+    trendState.confidence === "ok" &&
+    Math.abs(weeklyRate) >= 0.1 &&
+    remaining / weeklyRate > 0
       ? Math.ceil(remaining / weeklyRate)
       : null;
+  const movingAway =
+    remaining != null && weeklyRate != null && Math.abs(weeklyRate) >= 0.1 && remaining / weeklyRate < 0;
 
   // 7-day adherence
   const last7keys = [];
@@ -1269,7 +1335,7 @@ function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
                 />
                 <ReferenceLine y={settings.targetWeight} stroke="#2dd4bf" strokeDasharray="4 4" />
                 <Line type="monotone" dataKey="weight" name="daily" stroke="#475569" strokeWidth={1} dot={{ r: 1.5, fill: "#475569" }} isAnimationActive={false} />
-                <Line type="monotone" dataKey="avg" name="7d avg" stroke="#fbbf24" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                <Line type="monotone" dataKey="avg" name="trend" stroke="#fbbf24" strokeWidth={2.5} dot={false} isAnimationActive={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </div>
@@ -1279,7 +1345,7 @@ function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
           </div>
         )}
         <div className="flex gap-4 mt-1 text-xs font-mono text-slate-500">
-          <span><span className="text-amber-400">━</span> 7d avg</span>
+          <span><span className="text-amber-400">━</span> trend</span>
           <span><span className="text-slate-500">━</span> daily</span>
           <span><span className="text-teal-400">┄</span> goal</span>
         </div>
@@ -1288,14 +1354,24 @@ function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
       <div className="grid grid-cols-2 gap-2">
         <Stat label="Change so far" value={change != null ? `${change > 0 ? "+" : ""}${fmt1(change)}` : null} unit="kg" />
         <Stat label="To target" value={remaining != null ? fmt1(Math.abs(remaining)) : null} unit="kg" />
-        <Stat label="Rate (7d vs prev)" value={weeklyRate != null ? fmt1(weeklyRate) : null} unit="kg/wk" />
-        <Stat label="ETA at this rate" value={eta} unit={eta ? "weeks" : ""} />
-        <Stat label="Avg intake (7d)" value={avgKcal} unit="kcal" />
-        <Stat label="Avg protein (7d)" value={avgProt} unit="g" />
+        <Stat
+          label="Rate (14-day trend)"
+          value={weeklyRate != null ? `${trendState.confidence === "low" ? "~" : ""}${fmt1(weeklyRate)}` : null}
+          unit="kg/wk"
+        />
+        <Stat label="At current trend" value={movingAway ? "wrong way" : eta} unit={eta ? "weeks" : ""} />
+        <Stat
+          label={`Avg intake (${loggedDays.length}/7 logged)`}
+          value={avgKcal}
+          unit="kcal"
+        />
+        <Stat label={`Avg protein (${loggedDays.length}/7 logged)`} value={avgProt} unit="g" />
       </div>
 
+      {/* Generated from lib/lanes.js with the actual bodyweight — the same numbers the
+          badge and notifications check, so this text can't drift from the verdicts. */}
       <div className="text-xs text-slate-600 leading-relaxed px-1">
-        {(PHASES[settings.phase] || PHASES.cut).lane}
+        {laneText(settings.phase, currentAvg, {})}
       </div>
     </div>
   );

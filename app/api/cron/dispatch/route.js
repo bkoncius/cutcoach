@@ -3,6 +3,7 @@ import { getSupabaseAdmin } from "../../../../lib/supabaseAdmin";
 import { sendToUser } from "../../../../lib/push";
 import { nextTemplateFor } from "../../../../lib/program";
 import { REMINDERS, REMINDER_BY_ID, localParts, isDue } from "../../../../lib/reminders";
+import { computeTrend } from "../../../../lib/trend";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -201,19 +202,13 @@ async function buildContexts(admin, dateByUser) {
 function contextFor(u, date) {
   const p = u.profile || {};
 
-  // Mirrors the client's chartData/weeklyRate maths (CutCoachApp.jsx) — same window,
-  // same >=3-samples guard — so a notification never contradicts the Trend tab.
-  const series = u.logs
-    .filter((l) => l.weight != null && l.date <= date)
-    .map((l) => ({ date: l.date, weight: Number(l.weight) }))
-    .sort((a, b) => a.date.localeCompare(b.date));
-
-  const last7 = series.slice(-7);
-  const prev7 = series.slice(-14, -7);
-  const avg = (xs) => (xs.length ? xs.reduce((s, x) => s + x.weight, 0) / xs.length : null);
-  const avg7 = avg(last7);
-  const weeklyRate =
-    last7.length >= 3 && prev7.length >= 3 ? avg(last7) - avg(prev7) : null;
+  // Same module the Trend tab renders from (lib/trend.js) — one implementation, so a
+  // notification can never contradict the app. This replaced a hand-copied
+  // slice(-7)/slice(-14,-7) duplicate that windowed by entries instead of days.
+  const trend = computeTrend(
+    u.logs.map((l) => ({ date: l.date, weight: l.weight })),
+    date
+  );
 
   const todayLog = u.logs.find((l) => l.date === date);
   const todayMeals = u.meals.filter((m) => m.date === date);
@@ -232,8 +227,8 @@ function contextFor(u, date) {
     lastCheckin: p.last_checkin || null,
 
     weightToday: todayLog?.weight != null ? Number(todayLog.weight) : null,
-    avg7,
-    weeklyRate,
+    trendWeight: trend.trendWeight,
+    weeklyRate: trend.rate,
 
     kcalToday: sum(todayMeals, "kcal"),
     proteinToday: sum(todayMeals, "protein"),
