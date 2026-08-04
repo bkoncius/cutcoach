@@ -19,11 +19,14 @@ shared module consumed identically by the UI, the push notifications, and the co
 prompt. Every target change is recorded in `target_history` with the trend context
 that justified it.
 
-> **Migrating an existing deploy:** run `supabase/004_identity.sql`, deploy, and open
-> the app once — a prefilled setup wizard collects the new identity fields. Reminders
-> keep working in the meantime. Your displayed weekly rate will likely CHANGE after
-> this update: the old math overstated it (up to ~2× if you didn't weigh in daily).
-> The new number is the correct one.
+> **Migrating an existing deploy — ORDER MATTERS:** run `supabase/004_identity.sql`,
+> `005_engine.sql`, and `006_programs.sql` **before** deploying this version. The
+> dispatcher and the app read the new columns/tables on boot; deployed-before-migrated
+> runs degraded (empty ledger view, dispatcher 500s visible only in
+> `net._http_response`). After deploying, open the app once — a prefilled setup wizard
+> collects the new identity fields; reminders keep working in the meantime. Your
+> displayed weekly rate will likely CHANGE after this update: the old math overstated
+> it (up to ~2× if you didn't weigh in daily). The new number is the correct one.
 
 ## Launch checklist (~15 minutes)
 
@@ -195,7 +198,17 @@ lib/ledgerCache.js           localStorage snapshot for offline + instant boot
 lib/push.js                  web-push sender, prunes dead subscriptions
 lib/pushClient.js            browser subscription lifecycle
 lib/reminders.js             reminder catalog — shared by the UI and the dispatcher
-lib/program.js               the 4-day program — shared by the UI and the dispatcher
+lib/trend.js                 EWMA trend weight + 14-day regression rate (one impl, both sides)
+lib/lanes.js                 phase lanes as %BW/week — verdicts + generated prose
+lib/calc.js                  Mifflin-St Jeor, activity multipliers, floors, protein rules
+lib/units.js                 kg↔lb / cm↔ft-in at the display edge; storage stays metric
+lib/engine.js                the adaptive calorie engine (weekly reviews)
+lib/programs.js              program library + getTemplate resolver — shared by UI and dispatcher
+lib/coachContext.js          the coach system prompt, incl. the authoritative ENGINE block
+components/Onboarding.jsx    5-step setup wizard (gates the app until completed)
+components/ProposalCard.jsx  the weekly review card (Apply / Not now)
+components/ProfileCard.jsx   identity editing (settings sibling)
+components/ProgramCard.jsx   program & emphasis picker (settings sibling)
 assets/*.svg                 icon sources (npm run icons)
 supabase/schema.sql          tables + RLS (run once)
 supabase/002_push.sql        push tables + profile columns (re-runnable)

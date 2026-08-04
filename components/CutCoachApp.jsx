@@ -29,7 +29,7 @@ import { syncPushSubscription, unsubscribePush } from "../lib/pushClient";
 import { getTemplate, programFor, nextTemplateFor, finisherFor } from "../lib/programs";
 import { computeTrend, trendSeries } from "../lib/trend";
 import { runEngine } from "../lib/engine";
-import { laneVerdict, laneText, laneRules, weeksInLane } from "../lib/lanes";
+import { laneVerdict, laneText, weeksInLane } from "../lib/lanes";
 import { formatWeight, weightUnit, parseWeightInput, validWeightKg, kgToLb } from "../lib/units";
 import { suggestTargets, checkGoal } from "../lib/calc";
 import { buildCoachContext } from "../lib/coachContext";
@@ -40,7 +40,7 @@ import ProgramCard from "./ProgramCard";
 import ProposalCard from "./ProposalCard";
 import { Card, Eyebrow, Bar } from "./ui";
 
-const APP_VERSION = "3.1";
+const APP_VERSION = "4.0";
 
 // Shape-only. Targets are DELIBERATELY null — the onboarding wizard is the only
 // place they get minted (the old 2200/175/87/75 literals here were silently written
