@@ -18,52 +18,69 @@ import {
   deleteMeal as dbDeleteMeal,
   addWorkout as dbAddWorkout,
   addChatMessage,
+  recordTargetChange,
+  stampPhaseStart,
+  markDayComplete,
+  applyProposal,
 } from "../lib/db";
 import { getSupabase } from "../lib/supabaseClient";
 import { read as readLedger, write as writeLedger, clear as clearLedger } from "../lib/ledgerCache";
 import { syncPushSubscription, unsubscribePush } from "../lib/pushClient";
-import { PROGRAM, SEQUENCE, nextTemplateFor } from "../lib/program";
-import { onTrack } from "../lib/reminders";
+import { getTemplate, programFor, nextTemplateFor, finisherFor } from "../lib/programs";
+import { computeTrend, trendSeries } from "../lib/trend";
+import { runEngine } from "../lib/engine";
+import { laneVerdict, laneText, weeksInLane } from "../lib/lanes";
+import { formatWeight, weightUnit, parseWeightInput, validWeightKg, kgToLb } from "../lib/units";
+import { suggestTargets, checkGoal } from "../lib/calc";
+import { buildCoachContext } from "../lib/coachContext";
 import NotificationSettings from "./NotificationSettings";
+import Onboarding from "./Onboarding";
+import ProfileCard from "./ProfileCard";
+import ProgramCard from "./ProgramCard";
+import ProposalCard from "./ProposalCard";
 import { Card, Eyebrow, Bar } from "./ui";
 
-const APP_VERSION = "3.1";
+const APP_VERSION = "4.0";
 
+// Shape-only. Targets are DELIBERATELY null — the onboarding wizard is the only
+// place they get minted (the old 2200/175/87/75 literals here were silently written
+// to the DB for every new sign-up, branding everyone an 87→75 kg male cut). Anything
+// that renders targets sits behind the onboardedAt gate, where real values exist.
 const DEFAULT_SETTINGS = {
   phase: "cut",
-  kcalTarget: 2200,
-  proteinTarget: 175,
-  startWeight: 87,
-  targetWeight: 75,
+  kcalTarget: null,
+  proteinTarget: null,
+  startWeight: null,
+  targetWeight: null,
   lastCheckin: null,
   timezone: null,
   // Empty, not DEFAULT_REMINDERS: the dispatcher requires an explicit enabled:true,
   // so nothing fires until you've actually opened the reminders card and saved.
   reminders: {},
+  displayName: null,
+  sex: null,
+  birthdate: null,
+  heightCm: null,
+  activityLevel: null,
+  experience: null,
+  equipment: null,
+  daysPerWeek: null,
+  units: "metric",
+  bodyfatPct: null,
+  phaseStartedAt: null,
+  onboardedAt: null,
+  programId: null, // programFor() falls back to ul4-gym
+  emphasis: null,
 };
 
+// Lane prose no longer lives here — it's GENERATED from lib/lanes.js with the user's
+// actual bodyweight (laneText for display, laneRules for the coach prompt), so the
+// text can never contradict the verdict code again. `suggest` presets die in the
+// onboarding phase, replaced by lib/calc.js.
 const PHASES = {
-  cut: {
-    label: "Cut",
-    title: "The Cut",
-    suggest: { kcal: 2200, protein: 175, deltaKg: -12 },
-    lane: "Healthy lane: −0.5 to −0.7 kg/week on the 7-day average. Slower for 2–3 weeks → tighten intake ~150–200 kcal. Faster than −1.0 → eat a bit more; the muscle is the point.",
-    rules: "Phase: CUT. Lane: −0.5 to −0.7 kg/week. Slower than −0.35 for 2–3 weeks → advise −150–200 kcal or one extra Zone-2 session. Faster than −1.0 → advise +150 kcal to protect muscle. Protein is the non-negotiable target. Maintaining lifting loads counts as winning.",
-  },
-  maintain: {
-    label: "Maintain",
-    title: "Maintenance",
-    suggest: { kcal: 2750, protein: 160, deltaKg: 0 },
-    lane: "Lane: hold within ±0.3 kg/week on the 7-day average while pushing your lifts. Drifting for 2+ weeks → nudge intake 100–150 kcal.",
-    rules: "Phase: MAINTENANCE. Lane: hold within ±0.25 kg/week. Drifting 2+ weeks → advise ±100–150 kcal. Primary goal: push lift progression at stable bodyweight and consolidate habits.",
-  },
-  bulk: {
-    label: "Bulk",
-    title: "The Bulk",
-    suggest: { kcal: 3050, protein: 170, deltaKg: 5 },
-    lane: "Lean-gain lane: +0.2 to +0.35 kg/week on the 7-day average. Flat for 2–3 weeks → add ~100–150 kcal. Faster than +0.5 → trim ~150 kcal; excess speed is mostly fat.",
-    rules: "Phase: LEAN BULK. Lane: +0.2 to +0.35 kg/week. Flat for 2–3 weeks → advise +100–150 kcal. Faster than +0.5/week → advise −150 kcal since the excess is mostly fat. Primary goal: progressive overload — expect load or rep increases on main lifts most weeks. Protein stays high.",
-  },
+  cut: { label: "Cut", title: "The Cut", suggest: { kcal: 2200, protein: 175, deltaKg: -12 } },
+  maintain: { label: "Maintain", title: "Maintenance", suggest: { kcal: 2750, protein: 160, deltaKg: 0 } },
+  bulk: { label: "Bulk", title: "The Bulk", suggest: { kcal: 3050, protein: 170, deltaKg: 5 } },
 };
 
 /* ---------------- Helpers ---------------- */
@@ -97,6 +114,7 @@ export default function CutCoachApp({ userId }) {
   const [days, setDays] = useState({});       // { "YYYY-MM-DD": { weight, meals:[{id,name,kcal,protein,carbs,fat}] } }
   const [workouts, setWorkouts] = useState([]); // [{ id, date, template, exercises, finisher }]
   const [chat, setChat] = useState([]);        // [{ role, content }]
+  const [proposal, setProposal] = useState(null); // latest engine_proposals row
   const [active, setActive] = useState(null);  // active workout session
   const [showSettings, setShowSettings] = useState(false);
 
@@ -106,6 +124,7 @@ export default function CutCoachApp({ userId }) {
       setDays(all.days || {});
       setWorkouts(all.workouts || []);
       setChat(all.chat || []);
+      setProposal(all.proposal || null);
     };
 
     // Paint the last snapshot immediately; the network pass below overwrites it.
@@ -118,7 +137,8 @@ export default function CutCoachApp({ userId }) {
     (async () => {
       try {
         const all = await loadAll();
-        if (!all.settings) saveProfile(DEFAULT_SETTINGS).catch(console.error); // first run
+        // No profile row => brand-new account. Nothing is written here — the
+        // onboarding wizard (gated below on onboardedAt) is the only target minter.
         apply(all);
         writeLedger(userId, all);
         setLoadErr("");
@@ -176,11 +196,13 @@ export default function CutCoachApp({ userId }) {
     saveProfile(next).catch(console.error);
   };
 
-  // NotificationSettings writes to Supabase itself; this only mirrors the saved value
-  // into local state. Without it the card — which unmounts every time the settings
-  // sheet closes — would re-seed from a stale prop and show the previous toggles.
+  // The settings cards write to Supabase themselves; these only mirror the saved
+  // values into local state. Without them a card — which unmounts every time the
+  // settings sheet closes — would re-seed from a stale prop and show old values.
   const rememberReminders = (timezone, reminders) =>
     setSettings((s) => ({ ...s, timezone, reminders }));
+  const rememberIdentity = (p) => setSettings((s) => ({ ...s, ...p }));
+  const rememberProgram = (programId, emphasis) => setSettings((s) => ({ ...s, programId, emphasis }));
 
   const logWeight = (date, weight) => {
     setDays((d) => ({ ...d, [date]: { ...(d[date] || { meals: [] }), weight } }));
@@ -196,6 +218,13 @@ export default function CutCoachApp({ userId }) {
         meals: [...(((d[date] || {}).meals) || []), { ...meal, id }],
       },
     }));
+  };
+
+  // The engine's data-quality bit: only days explicitly marked complete feed the
+  // adaptive TDEE. Optimistic like logWeight.
+  const setDayComplete = (date, complete) => {
+    setDays((d) => ({ ...d, [date]: { ...(d[date] || { meals: [] }), intakeComplete: complete } }));
+    markDayComplete(date, complete).catch(console.error);
   };
 
   const deleteMealFn = (date, id) => {
@@ -223,94 +252,88 @@ export default function CutCoachApp({ userId }) {
   const kcalToday = (today.meals || []).reduce((s, m) => s + (Number(m.kcal) || 0), 0);
   const protToday = (today.meals || []).reduce((s, m) => s + (Number(m.protein) || 0), 0);
 
+  // All trend math lives in lib/trend.js — one shared implementation with the cron
+  // dispatcher, calendar-windowed so sparse logging can't inflate the rate (the old
+  // slice(-7) entry-windowing overstated an every-other-day logger's rate ~2×).
   const weightSeries = Object.entries(days)
-    .filter(([, v]) => v && v.weight)
+    .filter(([, v]) => v && v.weight != null)
     .map(([date, v]) => ({ date, weight: Number(v.weight) }))
     .sort((a, b) => a.date.localeCompare(b.date));
 
-  const chartData = weightSeries.map((e, i) => {
-    const win = weightSeries.slice(Math.max(0, i - 6), i + 1);
-    const avg = win.reduce((s, x) => s + x.weight, 0) / win.length;
-    return { label: shortDate(e.date), weight: e.weight, avg: +avg.toFixed(2) };
-  });
+  // Chart values are converted to display units HERE, at the edge — every stored and
+  // computed number stays metric.
+  const toDisplayW = (kg) =>
+    settings.units === "imperial" ? Math.round(kgToLb(kg) * 100) / 100 : kg;
+  const chartData = trendSeries(weightSeries).map((e) => ({
+    label: shortDate(e.date),
+    weight: toDisplayW(e.weight),
+    avg: toDisplayW(e.trend), // chart line keeps its dataKey; the value is now the EWMA trend
+  }));
 
-  const currentAvg = chartData.length ? chartData[chartData.length - 1].avg : null;
-  const last7 = weightSeries.slice(-7);
-  const prev7 = weightSeries.slice(-14, -7);
-  const weeklyRate =
-    last7.length >= 3 && prev7.length >= 3
-      ? last7.reduce((s, x) => s + x.weight, 0) / last7.length -
-        prev7.reduce((s, x) => s + x.weight, 0) / prev7.length
-      : null;
+  const trendState = computeTrend(weightSeries, tk);
+  const currentAvg = trendState.trendWeight;
+  const weeklyRate = trendState.rate;
 
   const lastOfTemplate = (t) =>
     [...workouts].filter((w) => w.template === t).sort((a, b) => b.date.localeCompare(a.date))[0];
 
-  const suggestedTemplate = nextTemplateFor(workouts);
+  const program = programFor(settings.programId);
+  const suggestedTemplate = nextTemplateFor(workouts, program.sequence);
 
   /* ---------- coach context ---------- */
 
-  const buildContext = () => {
-    const phase = PHASES[settings.phase] || PHASES.cut;
-    const workoutByDate = {};
-    workouts.forEach((w) => { workoutByDate[w.date] = PROGRAM[w.template].name; });
-
-    const lines = [];
-    for (let i = 13; i >= 0; i--) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
-      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      const v = days[k];
-      const parts = [];
-      if (v && v.weight) parts.push(`${fmt1(v.weight)}kg`);
-      if (v && (v.meals || []).length) {
-        const ms = v.meals;
-        const kc = ms.reduce((s, m) => s + (Number(m.kcal) || 0), 0);
-        const pr = ms.reduce((s, m) => s + (Number(m.protein) || 0), 0);
-        const cb = ms.reduce((s, m) => s + (Number(m.carbs) || 0), 0);
-        const ft = ms.reduce((s, m) => s + (Number(m.fat) || 0), 0);
-        parts.push(`${kc}kcal (${pr}P/${cb}C/${ft}F)`);
-      }
-      if (workoutByDate[k]) parts.push(`trained ${workoutByDate[k]}`);
-      if (parts.length) lines.push(`${shortDate(k)}: ${parts.join(", ")}`);
-    }
-
-    const todayMeals = (((days[todayKey()] || {}).meals) || [])
-      .map((m) => `${m.name} (${m.kcal}kcal ${m.protein}P/${m.carbs || 0}C/${m.fat || 0}F)`)
-      .join("; ");
-
-    const recentW = [...workouts].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6).map((w) => {
-      const ex = w.exercises
-        .map((e) => {
-          const sets = (e.sets || []).filter((s) => s.w && s.r);
-          return sets.length ? `${e.name} ${sets.map((s) => `${s.w}×${s.r}`).join(",")}` : null;
-        })
-        .filter(Boolean)
-        .join("; ");
-      return `${shortDate(w.date)} ${PROGRAM[w.template].name}${w.finisher ? " +cardio" : ""} — ${ex || "logged"}`;
+  // The whole prompt — identity, lanes, the ENGINE block, and the data — lives in
+  // lib/coachContext.js and is sent as the SYSTEM prompt on every turn, so replayed
+  // history keeps its context (the old version prepended it to the newest user
+  // message only).
+  const buildSystem = () =>
+    buildCoachContext({
+      settings,
+      days,
+      workouts,
+      trendState,
+      proposalRow: proposal,
+      todayKey: tk,
     });
-
-    return `You are the built-in AI coach in Benas's personal training & nutrition app. Profile: male, 29, 182 cm. Phase start weight ${settings.startWeight} kg, phase goal ${settings.targetWeight} kg. Program: 4-day upper/lower split (Lower A squat, Upper A bench, Lower B deadlift, Upper B overhead) with Zone-2/interval finishers, ~2 yrs lifting experience, full gym.
-Daily targets: ${settings.kcalTarget} kcal, ${settings.proteinTarget} g protein.
-${phase.rules}
-Universal rules: judge weight by the 7-day average only. Flag 2+ missing logging days honestly. Suggest a deload every 5–6 weeks of hard training.
-Style: thorough and specific — reference actual numbers from the data. For check-ins cover: weight trajectory vs the phase lane; calorie and protein adherence; macro balance, including carb placement on training vs rest days and fat consistency; lift-by-lift progression; then one concrete priority for today and any target adjustment per the phase rules. 250–400 words for check-ins, shorter for quick questions. Plain text only — no markdown, no asterisks, no headers, no bullet symbols. Short paragraphs.
-
-DATA — last 14 days (weight, intake, training):
-${lines.length ? lines.join("\n") : "No daily logs yet."}
-
-TODAY'S MEALS SO FAR:
-${todayMeals || "None yet."}
-
-RECENT WORKOUTS (all logged sets):
-${recentW.length ? recentW.join("\n") : "None logged yet."}`;
-  };
 
   if (loading) {
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center">
         <div className="text-slate-500 font-mono text-sm animate-pulse">loading your ledger…</div>
       </div>
+    );
+  }
+
+  // The onboarding gate: no onboardedAt means either a brand-new account or a
+  // pre-migration row (wizard shows prefilled from it). Everything below this line
+  // may assume real, non-null targets.
+  if (!settings.onboardedAt) {
+    if (loadErr) {
+      return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center px-8">
+          <div className="text-sm text-rose-400 text-center leading-relaxed">
+            Couldn't load your profile ({loadErr}). Setup needs a connection — check your network and reload.
+          </div>
+        </div>
+      );
+    }
+    return (
+      <Onboarding
+        settings={settings}
+        onComplete={(p, tk) => {
+          const next = {
+            ...settings,
+            ...p,
+            phaseStartedAt: tk,
+            onboardedAt: new Date().toISOString(),
+          };
+          setSettings(next);
+          setDays((d) => ({ ...d, [tk]: { ...(d[tk] || { meals: [] }), weight: p.startWeight } }));
+          // Persist the post-onboarding shape so an offline reopen lands in the app,
+          // not back in the wizard.
+          writeLedger(userId, { settings: next, days: { ...days, [tk]: { ...(days[tk] || { meals: [] }), weight: p.startWeight } }, workouts, chat });
+        }}
+      />
     );
   }
 
@@ -340,32 +363,51 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
             settings={settings} persistSettings={persistSettings}
             days={days} logWeight={logWeight}
             kcalToday={kcalToday} protToday={protToday}
-            currentAvg={currentAvg} weeklyRate={weeklyRate}
+            trendState={trendState} weightEntries={weightSeries}
             suggestedTemplate={suggestedTemplate}
             goTrain={() => setTab("train")} goCoach={() => setTab("coach")}
             showSettings={showSettings} setShowSettings={setShowSettings}
-            signOut={signOut} saveReminders={rememberReminders}
+            signOut={signOut} saveReminders={rememberReminders} saveIdentityLocal={rememberIdentity}
+            saveProgramLocal={rememberProgram}
+            proposal={proposal}
+            onProposalApplied={(res, p) => {
+              if (!res.alreadyActed) {
+                setSettings((s) => ({ ...s, kcalTarget: res.newKcal, proteinTarget: res.newProtein }));
+              }
+              setProposal((r) => (r ? { ...r, status: "applied" } : r));
+            }}
+            onProposalDismissed={() => setProposal((r) => (r ? { ...r, status: "dismissed" } : r))}
           />
         )}
         {tab === "food" && (
           <FoodTab days={days} addMeal={addMealFn} deleteMeal={deleteMealFn}
-            settings={settings} kcalToday={kcalToday} protToday={protToday} />
+            settings={settings} kcalToday={kcalToday} protToday={protToday}
+            setDayComplete={setDayComplete} />
         )}
         {tab === "train" && (
           <TrainTab
             active={active} setActive={setActive}
             workouts={workouts} onSaveWorkout={saveWorkoutFn}
             lastOfTemplate={lastOfTemplate} suggestedTemplate={suggestedTemplate}
+            program={program} programId={settings.programId}
+            emphasis={settings.emphasis} phase={settings.phase}
           />
         )}
         {tab === "trend" && (
           <TrendTab chartData={chartData} settings={settings}
-            currentAvg={currentAvg} weeklyRate={weeklyRate} days={days} />
+            trendState={trendState} days={days} />
         )}
         {tab === "coach" && (
           <CoachTab chat={chat} persistChat={persistChat}
-            buildContext={buildContext}
-            settings={settings} persistSettings={persistSettings} />
+            buildSystem={buildSystem}
+            settings={settings} persistSettings={persistSettings}
+            proposal={proposal}
+            onProposalApplied={(res) => {
+              if (!res.alreadyActed) {
+                setSettings((s) => ({ ...s, kcalTarget: res.newKcal, proteinTarget: res.newProtein }));
+              }
+              setProposal((r) => (r ? { ...r, status: "applied" } : r));
+            }} />
         )}
       </div>
 
@@ -405,29 +447,64 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
 
 function TodayTab({
   settings, persistSettings, days, logWeight, kcalToday, protToday,
-  currentAvg, weeklyRate, suggestedTemplate, goTrain, goCoach,
-  showSettings, setShowSettings, signOut, saveReminders,
+  trendState, weightEntries, suggestedTemplate, goTrain, goCoach,
+  showSettings, setShowSettings, signOut, saveReminders, saveIdentityLocal,
+  saveProgramLocal, proposal, onProposalApplied, onProposalDismissed,
 }) {
   const tk = todayKey();
-  const todaysWeight = days[tk] && days[tk].weight ? String(days[tk].weight) : "";
+  const units = settings.units || "metric";
+  const unit = weightUnit(units);
+  // Draft is in DISPLAY units; storage is always kg (lib/units.js converts at the edge).
+  const todaysWeight = days[tk] && days[tk].weight != null ? formatWeight(days[tk].weight, units) : "";
   const [w, setW] = useState(todaysWeight);
   const [savedFlash, setSavedFlash] = useState(false);
 
+  // Cached-then-network hydration can change today's stored weight after mount. Sync
+  // the draft only while the user hasn't typed — never clobber mid-edit.
+  const lastSynced = useRef(todaysWeight);
+  useEffect(() => {
+    if (todaysWeight !== lastSynced.current) {
+      if (w === lastSynced.current) setW(todaysWeight);
+      lastSynced.current = todaysWeight;
+    }
+  }, [todaysWeight, w]);
+
   const saveWeight = () => {
-    const val = parseFloat(String(w).replace(",", "."));
-    if (!val || val < 30 || val > 250) return;
-    logWeight(tk, val);
+    // The old hardcoded 30–250 check silently accepted a lb-thinking user's "185"
+    // and stored 185 kg. Parse in the display unit, validate in kg.
+    const kg = parseWeightInput(w, units);
+    if (!validWeightKg(kg)) return;
+    logWeight(tk, Math.round(kg * 10) / 10);
     setSavedFlash(true);
     setTimeout(() => setSavedFlash(false), 1200);
   };
 
+  const currentAvg = trendState.trendWeight;
+  const weeklyRate = trendState.rate;
+  const lowConf = trendState.confidence === "low";
+  const laneProfile = { sex: settings.sex, bodyfatPct: settings.bodyfatPct, experience: settings.experience };
+  // Same module the notifications and coach prompt use — they cannot disagree.
+  const verdict = laneVerdict(settings.phase, weeklyRate, currentAvg, laneProfile);
+  const goodRate = verdict === "in_lane" || verdict === "unknown";
+
+  const isMaintain = (settings.phase || "cut") === "maintain";
   const span = settings.targetWeight - settings.startWeight;
   const change = currentAvg != null ? currentAvg - settings.startWeight : 0;
-  const pct = span !== 0 ? Math.max(0, Math.min(100, (change / span) * 100)) : 0;
-  // Shared with the notification copy so the two can't disagree about "on track".
-  const goodRate = onTrack(settings.phase, weeklyRate);
+  const rawPct = span !== 0 ? (change / span) * 100 : 0;
+  const wrongDirection = !isMaintain && currentAvg != null && rawPct < -0.5;
+  const pct = Math.max(0, Math.min(100, rawPct));
+
+  // Maintenance has no start→goal distance to fill; show position inside the ±1%
+  // hold band plus how long the trend has stayed in lane.
+  const band = settings.startWeight * 0.01;
+  const gaugePct =
+    isMaintain && currentAvg != null && band > 0
+      ? Math.max(0, Math.min(100, ((currentAvg - (settings.startWeight - band)) / (2 * band)) * 100))
+      : 50;
+  const inLaneWeeks = isMaintain ? weeksInLane(weightEntries, tk, "maintain", laneProfile) : 0;
+
   const checkedInToday = settings.lastCheckin === tk;
-  const sugg = PROGRAM[suggestedTemplate];
+  const sugg = getTemplate(settings.programId, suggestedTemplate, settings.emphasis);
 
   const dateStr = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
 
@@ -446,39 +523,80 @@ function TodayTab({
       {showSettings && (
         <>
           <SettingsPanel settings={settings} persistSettings={persistSettings} currentAvg={currentAvg} signOut={signOut} />
-          {/* Sibling card, deliberately not folded into SettingsPanel: that panel holds
-              its own draft state and save button, and mixing reminders into it would let
-              a reminders save rewrite phase/targets from stale in-memory values. */}
+          {/* Sibling cards, deliberately not folded into SettingsPanel: each holds its
+              own draft state and its own narrow DB writer, so a save from one can never
+              rewrite another's columns from stale in-memory values. */}
+          <ProfileCard settings={settings} onSaved={saveIdentityLocal} />
+          <ProgramCard settings={settings} onSaved={saveProgramLocal} />
           <NotificationSettings settings={settings} onSaved={saveReminders} />
         </>
       )}
 
+      {/* The engine's weekly review, while pending. Deliberately ABOVE the hero:
+          when the plan wants an update, that's the day's most important card. */}
+      <ProposalCard row={proposal} settings={settings} onApplied={onProposalApplied} onDismissed={onProposalDismissed} />
+
       {/* Hero: the number that matters */}
       <Card className="border-amber-400 border-opacity-30">
-        <Eyebrow color="text-amber-400">7-day average — the number that matters</Eyebrow>
+        <Eyebrow color="text-amber-400">Trend weight — the number that matters</Eyebrow>
         <div className="flex items-end gap-3 mt-2">
           <div className="font-mono text-5xl font-bold tracking-tight">
-            {currentAvg != null ? fmt1(currentAvg) : "—"}
+            {formatWeight(currentAvg, units)}
           </div>
-          <div className="pb-1 text-slate-400 text-sm">kg</div>
+          <div className="pb-1 text-slate-400 text-sm">{unit}</div>
           {weeklyRate != null && (
             <div className={`ml-auto mb-1 font-mono text-sm px-2 py-1 rounded-lg ${
               goodRate ? "bg-slate-800 text-teal-300" : "bg-slate-800 text-rose-300"
             }`}>
-              {weeklyRate > 0 ? "+" : ""}{fmt1(weeklyRate)} kg/wk
+              {lowConf ? "~" : ""}{weeklyRate > 0 ? "+" : ""}{formatWeight(weeklyRate, units)} {unit}/wk
+              {verdict === "slow" ? " · slow" : verdict === "fast" ? " · fast" : ""}
             </div>
           )}
         </div>
-        <div className="mt-4">
-          <div className="flex justify-between text-xs font-mono text-slate-500 mb-1">
-            <span>{fmt1(settings.startWeight)}</span>
-            <span className="text-slate-300">{change > 0 ? "+" : ""}{fmt1(change)} kg · {Math.round(pct)}%</span>
-            <span>{fmt1(settings.targetWeight)}</span>
+        {weeklyRate == null && (
+          <div className="text-xs text-slate-500 mt-1">
+            {trendState.nPoints === 0
+              ? "Log your first weigh-in to start the trend."
+              : trendState.pointsNeeded > 0
+              ? `${trendState.pointsNeeded} more weigh-in${trendState.pointsNeeded === 1 ? "" : "s"} until your trend appears.`
+              : "A few more days of weigh-ins until your trend appears."}
           </div>
-          <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
-            <div className="h-full rounded-full bg-amber-400" style={{ width: `${pct}%` }} />
+        )}
+        {isMaintain ? (
+          /* Maintenance: a start→goal bar is meaningless (start === goal). Show
+             position inside the ±1% hold band and how long the trend has held it. */
+          <div className="mt-4">
+            <div className="flex justify-between text-xs font-mono text-slate-500 mb-1">
+              <span>{formatWeight(settings.startWeight - band, units)}</span>
+              <span className="text-slate-300">
+                {inLaneWeeks > 0 ? `${inLaneWeeks} wk${inLaneWeeks === 1 ? "" : "s"} in lane` : "hold the line"}
+              </span>
+              <span>{formatWeight(settings.startWeight + band, units)}</span>
+            </div>
+            <div className="relative h-2 rounded-full bg-slate-800">
+              <div className="absolute inset-y-0 left-1/2 w-px bg-slate-600" />
+              <div
+                className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 h-3 w-3 rounded-full ${
+                  goodRate ? "bg-teal-400" : "bg-rose-400"
+                }`}
+                style={{ left: `${gaugePct}%` }}
+              />
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="mt-4">
+            <div className="flex justify-between text-xs font-mono text-slate-500 mb-1">
+              <span>{formatWeight(settings.startWeight, units)}</span>
+              <span className={wrongDirection ? "text-rose-400" : "text-slate-300"}>
+                {change > 0 ? "+" : ""}{formatWeight(change, units)} {unit} · {wrongDirection ? "wrong way" : `${Math.round(pct)}%`}
+              </span>
+              <span>{formatWeight(settings.targetWeight, units)}</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+              <div className="h-full rounded-full bg-amber-400" style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        )}
       </Card>
 
       {/* Morning weigh-in */}
@@ -489,7 +607,7 @@ function TodayTab({
             value={w}
             onChange={(e) => setW(e.target.value)}
             inputMode="decimal"
-            placeholder="86.4"
+            placeholder={units === "imperial" ? "190.4" : "86.4"}
             className="flex-1 bg-slate-800 rounded-xl px-4 py-3 font-mono text-lg outline-none border border-slate-700 focus:border-amber-400"
           />
           <button
@@ -500,7 +618,7 @@ function TodayTab({
           </button>
         </div>
         {todaysWeight && !savedFlash && (
-          <div className="text-xs text-slate-500 mt-2 font-mono">logged today: {todaysWeight} kg — resave to correct</div>
+          <div className="text-xs text-slate-500 mt-2 font-mono">logged today: {todaysWeight} {unit} — resave to correct</div>
         )}
       </Card>
 
@@ -547,32 +665,87 @@ function TodayTab({
 }
 
 function SettingsPanel({ settings, persistSettings, currentAvg, signOut }) {
-  const [s, setS] = useState(settings);
+  const units = settings.units || "metric";
+  const unit = weightUnit(units);
+  // Draft weights live in DISPLAY units; converted back to kg on save.
+  const [s, setS] = useState({
+    ...settings,
+    startWeight: settings.startWeight != null ? formatWeight(settings.startWeight, units) : "",
+    targetWeight: settings.targetWeight != null ? formatWeight(settings.targetWeight, units) : "",
+  });
+  const [saveMsg, setSaveMsg] = useState(null);
   const upd = (k, v) => setS({ ...s, [k]: v });
 
   const pickPhase = (p) => {
     if (p === (s.phase || "cut")) return;
-    const base = currentAvg != null ? Math.round(currentAvg * 10) / 10 : Number(s.startWeight) || 0;
-    const sg = PHASES[p].suggest;
+    const base = currentAvg != null ? Math.round(currentAvg * 10) / 10 : parseWeightInput(s.startWeight, units);
+    // Computed from the actual person (lib/calc.js) — the old presets were absolute
+    // numbers for one specific 85 kg man, and deltaKg gave everyone a −12 kg goal.
+    const suggested = suggestTargets(
+      { sex: settings.sex, birthdate: settings.birthdate, heightCm: settings.heightCm, activityLevel: settings.activityLevel, bodyfatPct: settings.bodyfatPct },
+      base,
+      p
+    );
+    // Keep the existing goal only if it points the right way for the new phase;
+    // otherwise leave it blank and make the user choose — never invent a goal.
+    const prevGoalKg = parseWeightInput(s.targetWeight, units);
+    const goalCompatible =
+      p === "maintain" ||
+      (prevGoalKg != null && (p === "cut" ? prevGoalKg < base : prevGoalKg > base));
     setS({
       ...s,
       phase: p,
-      startWeight: base,
-      targetWeight: Math.round((base + sg.deltaKg) * 10) / 10,
-      kcalTarget: sg.kcal,
-      proteinTarget: sg.protein,
+      startWeight: base != null ? formatWeight(base, units) : "",
+      targetWeight:
+        p === "maintain"
+          ? base != null ? formatWeight(base, units) : ""
+          : goalCompatible ? s.targetWeight : "",
+      kcalTarget: suggested ? suggested.kcalTarget : s.kcalTarget,
+      proteinTarget: suggested ? suggested.proteinTarget : s.proteinTarget,
     });
   };
 
-  const save = () => {
+  const save = async () => {
+    setSaveMsg(null);
+    const startKg = parseWeightInput(s.startWeight, units);
+    const goalKg = parseWeightInput(s.targetWeight, units);
+    const kcal = Number(s.kcalTarget);
+    const protein = Number(s.proteinTarget);
+    const phase = s.phase || "cut";
+    if (![startKg, goalKg].every((v) => v != null) || ![kcal, protein].every(Number.isFinite)) {
+      setSaveMsg({ ok: false, text: "Fill in all four numbers before saving." });
+      return;
+    }
+    const check = checkGoal({ phase, currentKg: startKg, goalKg, heightCm: settings.heightCm });
+    if (!check.ok) {
+      setSaveMsg({ ok: false, text: check.error });
+      return;
+    }
+    const phaseChanged = phase !== (settings.phase || "cut");
+    const targetsChanged = kcal !== settings.kcalTarget || protein !== settings.proteinTarget;
     persistSettings({
       ...settings,
-      phase: s.phase || "cut",
-      kcalTarget: Number(s.kcalTarget) || settings.kcalTarget,
-      proteinTarget: Number(s.proteinTarget) || settings.proteinTarget,
-      targetWeight: Number(s.targetWeight) || settings.targetWeight,
-      startWeight: Number(s.startWeight) || settings.startWeight,
+      phase,
+      kcalTarget: kcal,
+      proteinTarget: protein,
+      startWeight: Math.round(startKg * 10) / 10,
+      targetWeight: Math.round(goalKg * 10) / 10,
+      ...(phaseChanged ? { phaseStartedAt: todayKey() } : {}),
     });
+    // Provenance for the adjustment engine: manual changes are history too.
+    if (phaseChanged || targetsChanged) {
+      recordTargetChange("manual", {
+        phase,
+        kcalTarget: kcal,
+        proteinTarget: protein,
+        prevKcal: settings.kcalTarget,
+        prevProtein: settings.proteinTarget,
+        context: { trendWeight: currentAvg },
+      }).catch(console.error);
+    }
+    if (phaseChanged) stampPhaseStart().catch(console.error);
+    setSaveMsg({ ok: true, text: check.warning || "Saved" });
+    setTimeout(() => setSaveMsg(null), 2500);
   };
 
   return (
@@ -595,21 +768,24 @@ function SettingsPanel({ settings, persistSettings, currentAvg, signOut }) {
       </div>
       {(s.phase || "cut") !== (settings.phase || "cut") && (
         <div className="text-xs text-slate-500 mt-2 leading-relaxed">
-          Targets prefilled for the new phase from your current average — adjust below, then save. The progress bar restarts from the new start weight; all history stays.
+          Calories and protein recomputed for the new phase from your profile — adjust below, then save. The progress bar restarts from the new start weight; all history stays.
         </div>
       )}
       <div className="mt-4"><Eyebrow>Targets</Eyebrow></div>
       <div className="flex gap-2 mt-2">
-        <TargetField label="kcal / day" value={s.kcalTarget} onChange={(v) => upd("kcalTarget", v)} />
-        <TargetField label="protein g" value={s.proteinTarget} onChange={(v) => upd("proteinTarget", v)} />
+        <TargetField label="kcal / day" value={s.kcalTarget ?? ""} onChange={(v) => upd("kcalTarget", v)} />
+        <TargetField label="protein g" value={s.proteinTarget ?? ""} onChange={(v) => upd("proteinTarget", v)} />
       </div>
       <div className="flex gap-2 mt-2">
-        <TargetField label="start kg" value={s.startWeight} onChange={(v) => upd("startWeight", v)} />
-        <TargetField label="goal kg" value={s.targetWeight} onChange={(v) => upd("targetWeight", v)} />
+        <TargetField label={`start ${unit}`} value={s.startWeight} onChange={(v) => upd("startWeight", v)} />
+        <TargetField label={`goal ${unit}`} value={s.targetWeight} onChange={(v) => upd("targetWeight", v)} />
       </div>
       <button onClick={save} className="mt-3 w-full py-2 rounded-xl bg-slate-800 text-sm font-semibold border border-slate-700">
         Save phase & targets
       </button>
+      {saveMsg && (
+        <div className={`text-xs mt-2 leading-relaxed ${saveMsg.ok ? "text-teal-400" : "text-rose-400"}`}>{saveMsg.text}</div>
+      )}
       <button
         onClick={signOut}
         className="mt-2 w-full py-2 rounded-xl text-xs text-slate-500 border border-slate-800"
@@ -636,9 +812,14 @@ function TargetField({ label, value, onChange }) {
 
 /* ---------------- Food ---------------- */
 
-function FoodTab({ days, addMeal: addMealDb, deleteMeal: deleteMealDb, settings, kcalToday, protToday }) {
+function FoodTab({ days, addMeal: addMealDb, deleteMeal: deleteMealDb, settings, kcalToday, protToday, setDayComplete }) {
   const tk = todayKey();
   const meals = (days[tk] && days[tk].meals) || [];
+  const yk = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
   const carbsToday = meals.reduce((s, m) => s + (Number(m.carbs) || 0), 0);
   const fatToday = meals.reduce((s, m) => s + (Number(m.fat) || 0), 0);
   const [desc, setDesc] = useState("");
@@ -991,6 +1172,40 @@ function FoodTab({ days, addMeal: addMealDb, deleteMeal: deleteMealDb, settings,
           </div>
         </Card>
       )}
+
+      {/* The adaptive engine's data-quality bit. Only days marked complete feed the
+          measured-TDEE calculation — an unmarked day is treated as unknown, never as
+          "ate nothing". Yesterday stays editable because most people notice at
+          breakfast that they forgot. */}
+      <Card>
+        <Eyebrow>Fully logged?</Eyebrow>
+        <div className="text-xs text-slate-500 mt-1 leading-relaxed">
+          Mark a day once everything you ate is in. Your weekly calorie review only
+          trusts complete days.
+        </div>
+        <div className="mt-3 space-y-2">
+          {[
+            { key: tk, label: "Today" },
+            { key: yk, label: "Yesterday" },
+          ].map(({ key, label }) => {
+            const done = !!(days[key] && days[key].intakeComplete);
+            return (
+              <button
+                key={key}
+                onClick={() => setDayComplete(key, !done)}
+                className={`w-full flex items-center justify-between rounded-xl border px-4 py-2.5 text-sm ${
+                  done ? "border-teal-400 border-opacity-40 bg-slate-800" : "border-slate-700 bg-slate-900"
+                }`}
+              >
+                <span className={done ? "text-slate-200" : "text-slate-400"}>{label}</span>
+                <span className={`flex items-center gap-1 text-xs font-semibold ${done ? "text-teal-400" : "text-slate-600"}`}>
+                  {done ? (<><Check size={14} /> complete</>) : "mark complete"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </Card>
     </div>
   );
 }
@@ -1012,13 +1227,18 @@ function MacroInput({ value, set, label }) {
 
 /* ---------------- Train ---------------- */
 
-function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, suggestedTemplate }) {
+function TrainTab({
+  active, setActive, workouts, onSaveWorkout, lastOfTemplate, suggestedTemplate,
+  program, programId, emphasis, phase,
+}) {
   const [saveErr, setSaveErr] = useState("");
   if (active) {
     return (
       <ActiveWorkout
         active={active}
         setActive={setActive}
+        template={getTemplate(programId, active.template, emphasis)}
+        phase={phase}
         onFinish={async (session) => {
           try {
             setSaveErr("");
@@ -1035,9 +1255,14 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
 
   const start = (templateId) => {
     const prev = lastOfTemplate(templateId);
-    const exercises = PROGRAM[templateId].exercises.map((ex) => {
-      const prevEx = prev && prev.exercises.find((e) => e.name === ex.name);
+    const exercises = getTemplate(programId, templateId, emphasis).exercises.map((ex) => {
+      // Prefill by exercise id first (stable across renames), name for legacy rows.
+      const prevEx =
+        prev &&
+        (prev.exercises.find((e) => e.id && ex.id && e.id === ex.id) ||
+          prev.exercises.find((e) => e.name === ex.name));
       return {
+        id: ex.id,
         name: ex.name,
         target: `${ex.sets} × ${ex.reps}${ex.rpe !== "—" ? ` @ RPE ${ex.rpe}` : ""}`,
         prev: prevEx
@@ -1058,12 +1283,12 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
   return (
     <div className="space-y-4">
       <div>
-        <Eyebrow color="text-amber-400">Train</Eyebrow>
+        <Eyebrow color="text-amber-400">Train · {program.name}</Eyebrow>
         <h1 className="text-xl font-bold tracking-tight mt-1">Pick your session</h1>
       </div>
 
-      {SEQUENCE.map((tid) => {
-        const t = PROGRAM[tid];
+      {program.sequence.map((tid) => {
+        const t = getTemplate(programId, tid, emphasis);
         const last = lastOfTemplate(tid);
         const isNext = tid === suggestedTemplate;
         return (
@@ -1075,7 +1300,7 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
                     {isNext && <span className="ml-2 text-xs font-mono text-amber-400">up next</span>}
                   </div>
                   <div className="text-xs text-slate-500 mt-1">
-                    {t.subtitle} · {t.exercises.length} lifts · {t.finisher}
+                    {t.subtitle} · {t.exercises.length} lifts · {finisherFor(t, phase)}
                   </div>
                   {last && <div className="text-xs font-mono text-slate-600 mt-1">last: {shortDate(last.date)}</div>}
                 </div>
@@ -1092,7 +1317,9 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
           <div className="mt-2 divide-y divide-slate-800">
             {history.map((w) => (
               <div key={w.id} className="py-2 flex justify-between text-sm">
-                <span>{PROGRAM[w.template].name}</span>
+                {/* Resolver, not a raw lookup: rows from a previous program must render,
+                    not crash the tab. */}
+                <span>{getTemplate(programId, w.template).name}</span>
                 <span className="font-mono text-xs text-slate-500">
                   {shortDate(w.date)}{w.finisher ? " · +cardio" : ""}
                 </span>
@@ -1105,8 +1332,8 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
   );
 }
 
-function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
-  const t = PROGRAM[active.template];
+function ActiveWorkout({ active, setActive, template, phase, onFinish, saveErr }) {
+  const t = template;
   const [state, setState] = useState(active);
 
   const updSet = (ei, si, field, val) => {
@@ -1136,6 +1363,9 @@ function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
       template: state.template,
       finisher: state.finisher,
       exercises: state.exercises.map((e) => ({
+        // id makes future prefill matching survive exercise renames; name kept for
+        // display and legacy compatibility.
+        ...(e.id ? { id: e.id } : {}),
         name: e.name,
         sets: e.sets.filter((s) => s.w || s.r).map((s) => ({ w: s.w, r: s.r })),
       })),
@@ -1202,7 +1432,7 @@ function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
       >
         <Card className={`flex items-center gap-3 ${state.finisher ? "border-teal-400 border-opacity-40" : ""}`}>
           <Flame size={18} className={state.finisher ? "text-teal-400" : "text-slate-600"} />
-          <div className="text-sm flex-1">Finisher: {t.finisher}</div>
+          <div className="text-sm flex-1">Finisher: {finisherFor(t, phase)}</div>
           {state.finisher && <Check size={16} className="text-teal-400" />}
         </Card>
       </button>
@@ -1217,13 +1447,55 @@ function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
 
 /* ---------------- Trend ---------------- */
 
-function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
+function TrendTab({ chartData, settings, trendState, days }) {
+  const units = settings.units || "metric";
+  const unit = weightUnit(units);
+  const goalY = units === "imperial" ? kgToLb(settings.targetWeight) : settings.targetWeight;
+  const currentAvg = trendState.trendWeight;
+  const weeklyRate = trendState.rate;
+
+  // Read-only client run of the SAME engine module the Monday dispatcher uses —
+  // live tiles here, authored proposals there, one implementation.
+  const engineView = runEngine({
+    weights: Object.entries(days)
+      .filter(([, v]) => v && v.weight != null)
+      .map(([date, v]) => ({ date, weight: Number(v.weight) })),
+    intake: Object.entries(days).map(([date, v]) => ({
+      date,
+      kcal: ((v && v.meals) || []).reduce((s, m) => s + (Number(m.kcal) || 0), 0),
+      complete: !!(v && v.intakeComplete),
+    })),
+    profile: {
+      sex: settings.sex,
+      birthdate: settings.birthdate,
+      heightCm: settings.heightCm,
+      activityLevel: settings.activityLevel,
+      bodyfatPct: settings.bodyfatPct,
+      experience: settings.experience,
+    },
+    targets: {
+      kcal: settings.kcalTarget,
+      protein: settings.proteinTarget,
+      phase: settings.phase,
+      phaseStartedAt: settings.phaseStartedAt,
+      proteinSetAtWeight: null, // tiles don't propose; protein rescale is the server's job
+    },
+    asOf: todayKey(),
+  });
   const change = currentAvg != null ? currentAvg - settings.startWeight : null;
   const remaining = currentAvg != null ? settings.targetWeight - currentAvg : null;
+  // Only project an arrival when the rate is trustworthy — a low-confidence slope
+  // extrapolated over months is a lie with a date on it.
   const eta =
-    remaining != null && weeklyRate != null && Math.abs(weeklyRate) > 0.05 && remaining / weeklyRate > 0
+    remaining != null &&
+    weeklyRate != null &&
+    trendState.confidence === "ok" &&
+    Math.abs(weeklyRate) >= 0.1 &&
+    remaining / weeklyRate > 0
       ? Math.ceil(remaining / weeklyRate)
       : null;
+  const movingAway =
+    remaining != null && weeklyRate != null && Math.abs(weeklyRate) >= 0.1 && remaining / weeklyRate < 0;
 
   // 7-day adherence
   const last7keys = [];
@@ -1267,9 +1539,9 @@ function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
                   contentStyle={{ background: "#0f172a", border: "1px solid #334155", borderRadius: 12, fontFamily: "monospace", fontSize: 12 }}
                   labelStyle={{ color: "#94a3b8" }}
                 />
-                <ReferenceLine y={settings.targetWeight} stroke="#2dd4bf" strokeDasharray="4 4" />
+                <ReferenceLine y={goalY} stroke="#2dd4bf" strokeDasharray="4 4" />
                 <Line type="monotone" dataKey="weight" name="daily" stroke="#475569" strokeWidth={1} dot={{ r: 1.5, fill: "#475569" }} isAnimationActive={false} />
-                <Line type="monotone" dataKey="avg" name="7d avg" stroke="#fbbf24" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                <Line type="monotone" dataKey="avg" name="trend" stroke="#fbbf24" strokeWidth={2.5} dot={false} isAnimationActive={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </div>
@@ -1279,23 +1551,43 @@ function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
           </div>
         )}
         <div className="flex gap-4 mt-1 text-xs font-mono text-slate-500">
-          <span><span className="text-amber-400">━</span> 7d avg</span>
+          <span><span className="text-amber-400">━</span> trend</span>
           <span><span className="text-slate-500">━</span> daily</span>
           <span><span className="text-teal-400">┄</span> goal</span>
         </div>
       </Card>
 
       <div className="grid grid-cols-2 gap-2">
-        <Stat label="Change so far" value={change != null ? `${change > 0 ? "+" : ""}${fmt1(change)}` : null} unit="kg" />
-        <Stat label="To target" value={remaining != null ? fmt1(Math.abs(remaining)) : null} unit="kg" />
-        <Stat label="Rate (7d vs prev)" value={weeklyRate != null ? fmt1(weeklyRate) : null} unit="kg/wk" />
-        <Stat label="ETA at this rate" value={eta} unit={eta ? "weeks" : ""} />
-        <Stat label="Avg intake (7d)" value={avgKcal} unit="kcal" />
-        <Stat label="Avg protein (7d)" value={avgProt} unit="g" />
+        <Stat label="Change so far" value={change != null ? `${change > 0 ? "+" : ""}${formatWeight(change, units)}` : null} unit={unit} />
+        <Stat label="To target" value={remaining != null ? formatWeight(Math.abs(remaining), units) : null} unit={unit} />
+        <Stat
+          label="Rate (14-day trend)"
+          value={weeklyRate != null ? `${trendState.confidence === "low" ? "~" : ""}${formatWeight(weeklyRate, units)}` : null}
+          unit={`${unit}/wk`}
+        />
+        <Stat label="At current trend" value={movingAway ? "wrong way" : eta} unit={eta ? "weeks" : ""} />
+        <Stat
+          label={`Avg intake (${loggedDays.length}/7 logged)`}
+          value={avgKcal}
+          unit="kcal"
+        />
+        <Stat label={`Avg protein (${loggedDays.length}/7 logged)`} value={avgProt} unit="g" />
+        <Stat
+          label={
+            engineView.blendWeight > 0
+              ? `Est. burn (${Math.round(engineView.blendWeight * 100)}% measured)`
+              : "Est. burn (formula)"
+          }
+          value={engineView.tdeeBlended}
+          unit="kcal"
+        />
+        <Stat label="Complete days (21d)" value={engineView.completeDays} unit={`/ ${21}`} />
       </div>
 
+      {/* Generated from lib/lanes.js with the actual bodyweight — the same numbers the
+          badge and notifications check, so this text can't drift from the verdicts. */}
       <div className="text-xs text-slate-600 leading-relaxed px-1">
-        {(PHASES[settings.phase] || PHASES.cut).lane}
+        {laneText(settings.phase, currentAvg, { sex: settings.sex, bodyfatPct: settings.bodyfatPct, experience: settings.experience }, units)}
       </div>
     </div>
   );
@@ -1303,10 +1595,12 @@ function TrendTab({ chartData, settings, currentAvg, weeklyRate, days }) {
 
 /* ---------------- Coach ---------------- */
 
-function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }) {
+function CoachTab({ chat, persistChat, buildSystem, settings, persistSettings, proposal, onProposalApplied }) {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [chipBusy, setChipBusy] = useState(false);
+  const [chipMsg, setChipMsg] = useState("");
   const bottomRef = useRef(null);
 
   useEffect(() => {
@@ -1323,12 +1617,11 @@ function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }
     setInput("");
     setBusy(true);
     try {
-      const history = nextChat.slice(-9, -1).map((m) => ({ role: m.role, content: m.content }));
-      const apiMessages = [
-        ...history,
-        { role: "user", content: `${buildContext()}\n\n---\nBenas says: ${text}` },
-      ];
-      const reply = await askClaude(apiMessages);
+      // Clean user/assistant history + the full context as SYSTEM: every turn now
+      // carries the profile, lanes, engine state, and data — the old approach glued
+      // the context onto the newest message only and replayed history without it.
+      const apiMessages = nextChat.slice(-9).map((m) => ({ role: m.role, content: m.content }));
+      const reply = await askClaude(apiMessages, { system: buildSystem() });
       const finalChat = [...nextChat, { role: "assistant", content: reply }].slice(-30);
       persistChat(finalChat);
       addChatMessage("assistant", reply).catch(console.error);
@@ -1339,11 +1632,29 @@ function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }
     setBusy(false);
   };
 
+  const pendingReview = proposal && proposal.status === "pending" && proposal.proposal;
+
   const checkin = () =>
     send(
-      "Do my full daily check-in. Go deep on the data: weight trajectory vs the phase lane, calorie and protein adherence, macro balance including carb placement around training days, progression on each main lift, then give me today's single priority and any target adjustment per the phase rules.",
+      "Do my full daily check-in. Go deep on the data: weight trajectory vs the phase lane, calorie and protein adherence, macro balance including carb placement around training days, progression on each main lift, then give me today's single priority." +
+        (pendingReview
+          ? " Also walk me through this week's pending target proposal from the engine — the numbers and why."
+          : ""),
       true
     );
+
+  const applyFromChat = async () => {
+    setChipBusy(true);
+    setChipMsg("");
+    try {
+      const res = await applyProposal(proposal, settings);
+      onProposalApplied(res);
+      setChipMsg(res.alreadyActed ? "Already applied." : `Applied — ${res.newKcal} kcal / ${res.newProtein} g.`);
+    } catch (e) {
+      setChipMsg(e?.message || "Couldn't apply.");
+    }
+    setChipBusy(false);
+  };
 
   return (
     <div className="space-y-4 flex flex-col" style={{ minHeight: "70vh" }}>
@@ -1386,6 +1697,22 @@ function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }
             </div>
           </div>
         )}
+        {/* Inline apply for the engine's pending weekly proposal — the same
+            applyProposal path as the Today card; the AI text above stays unparsed. */}
+        {pendingReview && !busy && (
+          <div className="flex justify-start">
+            <button
+              onClick={applyFromChat}
+              disabled={chipBusy}
+              className="px-3 py-2 rounded-xl border border-teal-400 border-opacity-40 bg-slate-900 text-teal-300 text-xs font-semibold disabled:opacity-50"
+            >
+              {chipBusy
+                ? "Applying…"
+                : `Apply this week's plan: ${proposal.proposal.newKcal} kcal${proposal.proposal.newProtein ? ` · ${proposal.proposal.newProtein} g protein` : ""}`}
+            </button>
+          </div>
+        )}
+        {chipMsg && <div className="text-xs text-teal-400">{chipMsg}</div>}
         {error && <div className="text-xs text-rose-400">{error}</div>}
         <div ref={bottomRef} />
       </div>

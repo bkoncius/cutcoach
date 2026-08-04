@@ -10,14 +10,35 @@ Installable PWA with an offline shell and **condition-aware push reminders** —
 only fire when something is actually outstanding, and never nag about a weigh-in or
 check-in you've already done.
 
+Self-serve for anyone: sign-up runs an onboarding wizard (sex, age, height, activity,
+experience, equipment, units) and computes personal calorie/protein targets via
+Mifflin-St Jeor with sex-specific safety floors — replacing the old hardcoded
+one-person defaults. Weight trend is a gap-tolerant EWMA + 14-day regression rate,
+and the phase "lanes" (healthy rates of change, % of bodyweight per week) are one
+shared module consumed identically by the UI, the push notifications, and the coach
+prompt. Every target change is recorded in `target_history` with the trend context
+that justified it.
+
+> **Migrating an existing deploy — ORDER MATTERS:** run `supabase/004_identity.sql`,
+> `005_engine.sql`, and `006_programs.sql` **before** deploying this version. The
+> dispatcher and the app read the new columns/tables on boot; deployed-before-migrated
+> runs degraded (empty ledger view, dispatcher 500s visible only in
+> `net._http_response`). After deploying, open the app once — a prefilled setup wizard
+> collects the new identity fields; reminders keep working in the meantime. Your
+> displayed weekly rate will likely CHANGE after this update: the old math overstated
+> it (up to ~2× if you didn't weigh in daily). The new number is the correct one.
+
 ## Launch checklist (~15 minutes)
 
 ### 1. Supabase project
 1. Go to https://supabase.com → New project (pick the EU region, e.g. Frankfurt).
 2. In the dashboard: **SQL Editor → New query** → paste the entire contents of
    `supabase/schema.sql` → **Run**. This creates all tables with row-level security.
-3. Same again with `supabase/002_push.sql` (notification tables + profile columns).
-   That one is safe to re-run; `schema.sql` is not.
+3. Same again with `supabase/002_push.sql` (notification tables + profile columns),
+   then `supabase/004_identity.sql` (client identity columns, target history, and the
+   removal of the one-size-fits-all target defaults), then `supabase/005_engine.sql`
+   (the day-complete flag + weekly review proposals). All safe to re-run;
+   `schema.sql` is not.
 4. **Authentication → Providers → Email**: make sure Email is enabled.
    Optional for solo use: turn OFF "Confirm email" so sign-up works instantly.
 5. **Project Settings → API**: copy the **Project URL**, the **anon public** key, and
@@ -177,12 +198,51 @@ lib/ledgerCache.js           localStorage snapshot for offline + instant boot
 lib/push.js                  web-push sender, prunes dead subscriptions
 lib/pushClient.js            browser subscription lifecycle
 lib/reminders.js             reminder catalog — shared by the UI and the dispatcher
-lib/program.js               the 4-day program — shared by the UI and the dispatcher
+lib/trend.js                 EWMA trend weight + 14-day regression rate (one impl, both sides)
+lib/lanes.js                 phase lanes as %BW/week — verdicts + generated prose
+lib/calc.js                  Mifflin-St Jeor, activity multipliers, floors, protein rules
+lib/units.js                 kg↔lb / cm↔ft-in at the display edge; storage stays metric
+lib/engine.js                the adaptive calorie engine (weekly reviews)
+lib/programs.js              program library + getTemplate resolver — shared by UI and dispatcher
+lib/coachContext.js          the coach system prompt, incl. the authoritative ENGINE block
+components/Onboarding.jsx    5-step setup wizard (gates the app until completed)
+components/ProposalCard.jsx  the weekly review card (Apply / Not now)
+components/ProfileCard.jsx   identity editing (settings sibling)
+components/ProgramCard.jsx   program & emphasis picker (settings sibling)
 assets/*.svg                 icon sources (npm run icons)
 supabase/schema.sql          tables + RLS (run once)
 supabase/002_push.sql        push tables + profile columns (re-runnable)
 supabase/003_cron.sql        pg_cron schedule (edit placeholders first)
 ```
+
+## How the adaptive calorie engine works
+
+Every Monday morning (06:00–06:30 in *your* timezone — the 5-minute cron the reminders
+already ride), the dispatcher runs `lib/engine.js` per user:
+
+1. **Measured burn**: mean intake over fully-logged days minus what the 21-day trend
+   says you banked (`7700 kcal/kg`). Gated behind ≥8 complete days and ≥6 weigh-ins
+   spanning ≥14 days — below that, an energy-balance TDEE is noise dressed as science.
+2. **Blend**: measured burn is confidence-weighted against the Mifflin-St Jeor formula
+   (0% data → pure formula; 14 complete days across 3 weeks → pure measurement).
+3. **Verdict**: your trend rate vs the phase lane (`lib/lanes.js`).
+4. **Proposal**: a kcal step sized to point the trend back at mid-lane, capped at
+   ±200/week (deliberate under-correction — consecutive weeks converge), floored at
+   1500 M / 1200 F and 75% of burn. Protein rescales when bodyweight has moved ≥2.5 kg.
+5. **Guards**: no proposals in a phase's first 14 days, within a week of any target
+   change, on low-confidence trends, or — the death-spiral blocker — when logged intake
+   can't plausibly explain the trend (under-logging gets called out instead of "eat less").
+
+The result lands in `engine_proposals` (one row per user-week, claimed via a unique
+index so duplicate cron ticks are harmless). **Nothing applies automatically**: a card
+on the Today tab shows the numbers and the reason; you tap Apply. The `weekly_review`
+reminder (default 08:00 Monday) knocks only when a proposal is actually pending. Weeks
+with nothing to change are recorded too (`status: none` with the hold reason), so the
+coach can say "reviewed, you're in the lane" instead of going quiet.
+
+"Fully logged" is an explicit tap on the Food tab (today or yesterday) — deliberately
+not a heuristic, because a meals-count guess misreads both fasting days and grazing
+days, and the whole engine stands on that flag being honest.
 
 ## How reminders work
 `lib/reminders.js` is the single source of truth — the settings UI and the cron

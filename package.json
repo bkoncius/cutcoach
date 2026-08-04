@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "icons": "node scripts/gen-icons.mjs"
+    "icons": "node scripts/gen-icons.mjs",
+    "test:libs": "node scripts/test-trend.mjs && node scripts/test-lanes.mjs && node scripts/test-reminders.mjs && node scripts/test-calc.mjs && node scripts/test-engine.mjs && node scripts/test-programs.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
