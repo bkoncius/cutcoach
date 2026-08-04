@@ -50,11 +50,16 @@ async function dispatch(req) {
 
   const admin = getSupabaseAdmin();
 
-  // 1) Only users who could actually receive something.
+  // 1) Only users who could actually receive something. Null targets (an account
+  //    that never finished onboarding) are excluded here rather than defaulted later —
+  //    a wrong number in a push notification is worse than silence. A pre-wizard row
+  //    with real targets still gets its reminders.
   const { data: profiles, error: pErr } = await admin
     .from("profiles")
-    .select("user_id, timezone, reminders, phase, kcal_target, protein_target, last_checkin")
-    .not("timezone", "is", null);
+    .select("user_id, timezone, reminders, phase, kcal_target, protein_target, last_checkin, units, sex, bodyfat_pct, experience")
+    .not("timezone", "is", null)
+    .not("kcal_target", "is", null)
+    .not("protein_target", "is", null);
   if (pErr) return Response.json({ error: pErr.message }, { status: 500 });
 
   const { data: subRows, error: sErr } = await admin.from("push_subscriptions").select("user_id");
@@ -88,8 +93,12 @@ async function dispatch(req) {
   // 4) Bulk-fetch conditions for just the due users — not N queries per user.
   //    Each user has exactly one local date, so this is one context per user.
   const dateByUser = {};
-  for (const d of due) dateByUser[d.profile.user_id] = d.local.date;
-  const ctxByUser = await buildContexts(admin, dateByUser);
+  const profileByUser = {};
+  for (const d of due) {
+    dateByUser[d.profile.user_id] = d.local.date;
+    profileByUser[d.profile.user_id] = d.profile;
+  }
+  const ctxByUser = await buildContexts(admin, dateByUser, profileByUser);
 
   // 5+6+7) Evaluate, claim, send.
   const planned = [];
@@ -166,33 +175,30 @@ const short = (id) => `${String(id).slice(0, 8)}…`;
 const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 
 /**
- * One bulk read per table for every due user, grouped in JS.
- * dateByUser: { [userId]: localDate }  ->  { [userId]: ctx }
+ * One bulk read per table for every due user, grouped in JS. Profile rows come from
+ * the caller (already fetched with everything contextFor needs) — re-querying them
+ * here was both redundant and, once identity columns landed, silently incomplete.
+ * dateByUser: { [userId]: localDate }, profileByUser: { [userId]: profileRow }
+ * -> { [userId]: ctx }
  */
-async function buildContexts(admin, dateByUser) {
+async function buildContexts(admin, dateByUser, profileByUser) {
   const userIds = Object.keys(dateByUser);
   const dates = [...new Set(Object.values(dateByUser))];
   const minDate = dates.slice().sort()[0];
-  // 21 days back covers the 7-day average plus the previous 7 for the weekly rate,
-  // with slack for missed days.
+  // 21 days back gives the 14-day trend window slack for missed days.
   const from = shiftDate(minDate, -21);
 
-  const [logsRes, mealsRes, workoutsRes, profilesRes] = await Promise.all([
+  const [logsRes, mealsRes, workoutsRes] = await Promise.all([
     admin.from("daily_logs").select("user_id, date, weight").in("user_id", userIds).gte("date", from),
     admin.from("meals").select("user_id, date, kcal, protein").in("user_id", userIds).in("date", dates),
     admin.from("workouts").select("user_id, date, template, exercises").in("user_id", userIds).gte("date", from),
-    admin
-      .from("profiles")
-      .select("user_id, phase, kcal_target, protein_target, last_checkin")
-      .in("user_id", userIds),
   ]);
 
   const byUser = {};
-  for (const id of userIds) byUser[id] = { logs: [], meals: [], workouts: [], profile: null };
+  for (const id of userIds) byUser[id] = { logs: [], meals: [], workouts: [], profile: profileByUser[id] || null };
   for (const r of logsRes.data || []) byUser[r.user_id]?.logs.push(r);
   for (const r of mealsRes.data || []) byUser[r.user_id]?.meals.push(r);
   for (const r of workoutsRes.data || []) byUser[r.user_id]?.workouts.push(r);
-  for (const r of profilesRes.data || []) if (byUser[r.user_id]) byUser[r.user_id].profile = r;
 
   const out = {};
   for (const id of userIds) out[id] = contextFor(byUser[id], dateByUser[id]);
@@ -222,9 +228,14 @@ function contextFor(u, date) {
 
   return {
     phase: p.phase || "cut",
-    kcalTarget: p.kcal_target ?? 2200,
-    proteinTarget: p.protein_target ?? 175,
+    // No fallbacks: rows with null targets never reach this function (filtered at the
+    // top-level select). The old `?? 2200 / ?? 175` here could put an invented number
+    // in a push notification.
+    kcalTarget: p.kcal_target,
+    proteinTarget: p.protein_target,
     lastCheckin: p.last_checkin || null,
+    units: p.units || "metric",
+    laneProfile: { sex: p.sex, bodyfatPct: p.bodyfat_pct != null ? Number(p.bodyfat_pct) : null, experience: p.experience },
 
     weightToday: todayLog?.weight != null ? Number(todayLog.weight) : null,
     trendWeight: trend.trendWeight,

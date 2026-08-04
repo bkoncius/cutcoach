@@ -10,14 +10,31 @@ Installable PWA with an offline shell and **condition-aware push reminders** —
 only fire when something is actually outstanding, and never nag about a weigh-in or
 check-in you've already done.
 
+Self-serve for anyone: sign-up runs an onboarding wizard (sex, age, height, activity,
+experience, equipment, units) and computes personal calorie/protein targets via
+Mifflin-St Jeor with sex-specific safety floors — replacing the old hardcoded
+one-person defaults. Weight trend is a gap-tolerant EWMA + 14-day regression rate,
+and the phase "lanes" (healthy rates of change, % of bodyweight per week) are one
+shared module consumed identically by the UI, the push notifications, and the coach
+prompt. Every target change is recorded in `target_history` with the trend context
+that justified it.
+
+> **Migrating an existing deploy:** run `supabase/004_identity.sql`, deploy, and open
+> the app once — a prefilled setup wizard collects the new identity fields. Reminders
+> keep working in the meantime. Your displayed weekly rate will likely CHANGE after
+> this update: the old math overstated it (up to ~2× if you didn't weigh in daily).
+> The new number is the correct one.
+
 ## Launch checklist (~15 minutes)
 
 ### 1. Supabase project
 1. Go to https://supabase.com → New project (pick the EU region, e.g. Frankfurt).
 2. In the dashboard: **SQL Editor → New query** → paste the entire contents of
    `supabase/schema.sql` → **Run**. This creates all tables with row-level security.
-3. Same again with `supabase/002_push.sql` (notification tables + profile columns).
-   That one is safe to re-run; `schema.sql` is not.
+3. Same again with `supabase/002_push.sql` (notification tables + profile columns),
+   then `supabase/004_identity.sql` (client identity columns, target history, and the
+   removal of the one-size-fits-all target defaults). Both are safe to re-run;
+   `schema.sql` is not.
 4. **Authentication → Providers → Email**: make sure Email is enabled.
    Optional for solo use: turn OFF "Confirm email" so sign-up works instantly.
 5. **Project Settings → API**: copy the **Project URL**, the **anon public** key, and
