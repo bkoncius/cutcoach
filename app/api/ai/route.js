@@ -15,6 +15,10 @@ export async function POST(req) {
       return Response.json({ error: { message: "messages required" } }, { status: 400 });
     }
     const maxTokens = Math.min(Number(body?.max_tokens) || 1024, 2048);
+    // Optional system prompt. Length-capped to bound input tokens; no tools
+    // passthrough on purpose — the deterministic engine decides all numbers, the
+    // model only ever explains them.
+    const system = typeof body?.system === "string" ? body.system.slice(0, 16000) : undefined;
 
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -27,6 +31,7 @@ export async function POST(req) {
         model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
         max_tokens: maxTokens,
         messages,
+        ...(system ? { system } : {}),
       }),
     });
 

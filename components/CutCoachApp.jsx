@@ -21,6 +21,7 @@ import {
   recordTargetChange,
   stampPhaseStart,
   markDayComplete,
+  applyProposal,
 } from "../lib/db";
 import { getSupabase } from "../lib/supabaseClient";
 import { read as readLedger, write as writeLedger, clear as clearLedger } from "../lib/ledgerCache";
@@ -30,7 +31,8 @@ import { computeTrend, trendSeries } from "../lib/trend";
 import { runEngine } from "../lib/engine";
 import { laneVerdict, laneText, laneRules, weeksInLane } from "../lib/lanes";
 import { formatWeight, weightUnit, parseWeightInput, validWeightKg, kgToLb } from "../lib/units";
-import { ageFrom, suggestTargets, checkGoal } from "../lib/calc";
+import { suggestTargets, checkGoal } from "../lib/calc";
+import { buildCoachContext } from "../lib/coachContext";
 import NotificationSettings from "./NotificationSettings";
 import Onboarding from "./Onboarding";
 import ProfileCard from "./ProfileCard";
@@ -280,88 +282,19 @@ export default function CutCoachApp({ userId }) {
 
   /* ---------- coach context ---------- */
 
-  const buildContext = () => {
-    const workoutByDate = {};
-    // getTemplate never throws on unknown ids — history from an old program renders
-    // its name instead of crashing the whole Coach tab.
-    workouts.forEach((w) => { workoutByDate[w.date] = getTemplate(settings.programId, w.template).name; });
-
-    const lines = [];
-    for (let i = 13; i >= 0; i--) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
-      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      const v = days[k];
-      const parts = [];
-      if (v && v.weight) parts.push(`${fmt1(v.weight)}kg`);
-      if (v && (v.meals || []).length) {
-        const ms = v.meals;
-        const kc = ms.reduce((s, m) => s + (Number(m.kcal) || 0), 0);
-        const pr = ms.reduce((s, m) => s + (Number(m.protein) || 0), 0);
-        const cb = ms.reduce((s, m) => s + (Number(m.carbs) || 0), 0);
-        const ft = ms.reduce((s, m) => s + (Number(m.fat) || 0), 0);
-        parts.push(`${kc}kcal (${pr}P/${cb}C/${ft}F)`);
-      }
-      if (workoutByDate[k]) parts.push(`trained ${workoutByDate[k]}`);
-      if (parts.length) lines.push(`${shortDate(k)}: ${parts.join(", ")}`);
-    }
-
-    const todayMeals = (((days[todayKey()] || {}).meals) || [])
-      .map((m) => `${m.name} (${m.kcal}kcal ${m.protein}P/${m.carbs || 0}C/${m.fat || 0}F)`)
-      .join("; ");
-
-    const recentW = [...workouts].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6).map((w) => {
-      const ex = w.exercises
-        .map((e) => {
-          const sets = (e.sets || []).filter((s) => s.w && s.r);
-          return sets.length ? `${e.name} ${sets.map((s) => `${s.w}×${s.r}`).join(",")}` : null;
-        })
-        .filter(Boolean)
-        .join("; ");
-      return `${shortDate(w.date)} ${getTemplate(settings.programId, w.template).name}${w.finisher ? " +cardio" : ""} — ${ex || "logged"}`;
+  // The whole prompt — identity, lanes, the ENGINE block, and the data — lives in
+  // lib/coachContext.js and is sent as the SYSTEM prompt on every turn, so replayed
+  // history keeps its context (the old version prepended it to the newest user
+  // message only).
+  const buildSystem = () =>
+    buildCoachContext({
+      settings,
+      days,
+      workouts,
+      trendState,
+      proposalRow: proposal,
+      todayKey: tk,
     });
-
-    // Lane rules are GENERATED from lib/lanes.js with the user's actual weight — the
-    // same numbers the badge and notifications check, so prompt and UI can't drift.
-    const laneProfile = { sex: settings.sex, bodyfatPct: settings.bodyfatPct, experience: settings.experience };
-    const rules = laneRules(settings.phase, currentAvg ?? weightSeries[weightSeries.length - 1]?.weight, laneProfile);
-    const trendLine =
-      currentAvg != null
-        ? `Current trend weight ${fmt1(currentAvg)} kg${weeklyRate != null ? `, moving ${weeklyRate > 0 ? "+" : ""}${weeklyRate.toFixed(2)} kg/week` : " (not enough weigh-ins yet for a rate)"}.`
-        : "No weigh-ins yet.";
-
-    // Identity from the actual profile — the old hardcoded "Benas... male, 29, 182 cm"
-    // string described exactly one person and was served to everyone.
-    const name = settings.displayName || "the client";
-    const sexWord = settings.sex === "male" ? "male" : settings.sex === "female" ? "female" : "unspecified sex";
-    const age = settings.birthdate ? ageFrom(settings.birthdate) : null;
-    const identity = `You are the built-in AI coach in CutCoach, a personal training & nutrition app. Client: ${name}, ${sexWord}${age ? `, ${age}` : ""}${settings.heightCm ? `, ${Math.round(settings.heightCm)} cm` : ""}${settings.bodyfatPct ? `, ~${settings.bodyfatPct}% body fat` : ""}. ${settings.experience || "intermediate"} lifter, ${settings.equipment === "gym" ? "full gym" : settings.equipment === "dumbbells" ? "dumbbells only" : settings.equipment === "bodyweight" ? "no equipment" : "full gym"}, ${settings.daysPerWeek || 4} training days/week. Program: ${program.name} with cardio finishers.`;
-    const femaleNote =
-      settings.sex === "female"
-        ? "\nFemale-specific: expect intra-month water-weight fluctuations of 1-2 kg on a roughly monthly rhythm; judge progress across 2-4 week trend windows and never recommend calorie cuts in response to a single-week stall that may coincide with cyclical retention."
-        : "";
-    const unitsNote =
-      settings.units === "imperial"
-        ? "\nThe client thinks in pounds — communicate weights in lb (data below is in kg; convert when you mention numbers)."
-        : "";
-
-    return `${identity}
-Phase start weight ${settings.startWeight} kg, phase goal ${settings.targetWeight} kg.
-Daily targets: ${settings.kcalTarget} kcal, ${settings.proteinTarget} g protein.
-${trendLine}
-${rules}${femaleNote}${unitsNote}
-Universal rules: judge weight by the trend weight only, never single days. Flag 2+ missing logging days honestly. Suggest a deload every 5–6 weeks of hard training.
-Style: thorough and specific — reference actual numbers from the data. For check-ins cover: weight trajectory vs the phase lane; calorie and protein adherence; macro balance, including carb placement on training vs rest days and fat consistency; lift-by-lift progression; then one concrete priority for today and any target adjustment per the phase rules. 250–400 words for check-ins, shorter for quick questions. Plain text only — no markdown, no asterisks, no headers, no bullet symbols. Short paragraphs.
-
-DATA — last 14 days (weight, intake, training):
-${lines.length ? lines.join("\n") : "No daily logs yet."}
-
-TODAY'S MEALS SO FAR:
-${todayMeals || "None yet."}
-
-RECENT WORKOUTS (all logged sets):
-${recentW.length ? recentW.join("\n") : "None logged yet."}`;
-  };
 
   if (loading) {
     return (
@@ -466,8 +399,15 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
         )}
         {tab === "coach" && (
           <CoachTab chat={chat} persistChat={persistChat}
-            buildContext={buildContext}
-            settings={settings} persistSettings={persistSettings} />
+            buildSystem={buildSystem}
+            settings={settings} persistSettings={persistSettings}
+            proposal={proposal}
+            onProposalApplied={(res) => {
+              if (!res.alreadyActed) {
+                setSettings((s) => ({ ...s, kcalTarget: res.newKcal, proteinTarget: res.newProtein }));
+              }
+              setProposal((r) => (r ? { ...r, status: "applied" } : r));
+            }} />
         )}
       </div>
 
@@ -1655,10 +1595,12 @@ function TrendTab({ chartData, settings, trendState, days }) {
 
 /* ---------------- Coach ---------------- */
 
-function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }) {
+function CoachTab({ chat, persistChat, buildSystem, settings, persistSettings, proposal, onProposalApplied }) {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [chipBusy, setChipBusy] = useState(false);
+  const [chipMsg, setChipMsg] = useState("");
   const bottomRef = useRef(null);
 
   useEffect(() => {
@@ -1675,13 +1617,11 @@ function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }
     setInput("");
     setBusy(true);
     try {
-      const history = nextChat.slice(-9, -1).map((m) => ({ role: m.role, content: m.content }));
-      const speaker = settings.displayName || "The client";
-      const apiMessages = [
-        ...history,
-        { role: "user", content: `${buildContext()}\n\n---\n${speaker} says: ${text}` },
-      ];
-      const reply = await askClaude(apiMessages);
+      // Clean user/assistant history + the full context as SYSTEM: every turn now
+      // carries the profile, lanes, engine state, and data — the old approach glued
+      // the context onto the newest message only and replayed history without it.
+      const apiMessages = nextChat.slice(-9).map((m) => ({ role: m.role, content: m.content }));
+      const reply = await askClaude(apiMessages, { system: buildSystem() });
       const finalChat = [...nextChat, { role: "assistant", content: reply }].slice(-30);
       persistChat(finalChat);
       addChatMessage("assistant", reply).catch(console.error);
@@ -1692,11 +1632,29 @@ function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }
     setBusy(false);
   };
 
+  const pendingReview = proposal && proposal.status === "pending" && proposal.proposal;
+
   const checkin = () =>
     send(
-      "Do my full daily check-in. Go deep on the data: weight trajectory vs the phase lane, calorie and protein adherence, macro balance including carb placement around training days, progression on each main lift, then give me today's single priority and any target adjustment per the phase rules.",
+      "Do my full daily check-in. Go deep on the data: weight trajectory vs the phase lane, calorie and protein adherence, macro balance including carb placement around training days, progression on each main lift, then give me today's single priority." +
+        (pendingReview
+          ? " Also walk me through this week's pending target proposal from the engine — the numbers and why."
+          : ""),
       true
     );
+
+  const applyFromChat = async () => {
+    setChipBusy(true);
+    setChipMsg("");
+    try {
+      const res = await applyProposal(proposal, settings);
+      onProposalApplied(res);
+      setChipMsg(res.alreadyActed ? "Already applied." : `Applied — ${res.newKcal} kcal / ${res.newProtein} g.`);
+    } catch (e) {
+      setChipMsg(e?.message || "Couldn't apply.");
+    }
+    setChipBusy(false);
+  };
 
   return (
     <div className="space-y-4 flex flex-col" style={{ minHeight: "70vh" }}>
@@ -1739,6 +1697,22 @@ function CoachTab({ chat, persistChat, buildContext, settings, persistSettings }
             </div>
           </div>
         )}
+        {/* Inline apply for the engine's pending weekly proposal — the same
+            applyProposal path as the Today card; the AI text above stays unparsed. */}
+        {pendingReview && !busy && (
+          <div className="flex justify-start">
+            <button
+              onClick={applyFromChat}
+              disabled={chipBusy}
+              className="px-3 py-2 rounded-xl border border-teal-400 border-opacity-40 bg-slate-900 text-teal-300 text-xs font-semibold disabled:opacity-50"
+            >
+              {chipBusy
+                ? "Applying…"
+                : `Apply this week's plan: ${proposal.proposal.newKcal} kcal${proposal.proposal.newProtein ? ` · ${proposal.proposal.newProtein} g protein` : ""}`}
+            </button>
+          </div>
+        )}
+        {chipMsg && <div className="text-xs text-teal-400">{chipMsg}</div>}
         {error && <div className="text-xs text-rose-400">{error}</div>}
         <div ref={bottomRef} />
       </div>
