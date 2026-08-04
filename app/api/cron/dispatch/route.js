@@ -1,7 +1,7 @@
 import { requireCron } from "../../../../lib/serverAuth";
 import { getSupabaseAdmin } from "../../../../lib/supabaseAdmin";
 import { sendToUser } from "../../../../lib/push";
-import { nextTemplateFor } from "../../../../lib/program";
+import { nextTemplateFor, sequenceFor } from "../../../../lib/programs";
 import { REMINDERS, REMINDER_BY_ID, localParts, isDue } from "../../../../lib/reminders";
 import { computeTrend } from "../../../../lib/trend";
 import { runEngine, weekStartFor, ENGINE_WINDOW_DAYS } from "../../../../lib/engine";
@@ -58,7 +58,7 @@ async function dispatch(req) {
   const { data: profiles, error: pErr } = await admin
     .from("profiles")
     .select(
-      "user_id, timezone, reminders, phase, kcal_target, protein_target, last_checkin, units, sex, bodyfat_pct, experience, birthdate, height_cm, activity_level, phase_started_at"
+      "user_id, timezone, reminders, phase, kcal_target, protein_target, last_checkin, units, sex, bodyfat_pct, experience, birthdate, height_cm, activity_level, phase_started_at, program_id"
     )
     .not("timezone", "is", null)
     .not("kcal_target", "is", null)
@@ -397,8 +397,9 @@ function contextFor(u, date) {
     trainedToday: !!todayWorkout,
     todayTemplate: todayWorkout?.template || null,
     daysSinceWorkout: lastWorkout ? daysBetween(lastWorkout.date, date) : null,
-    nextTemplate: nextTemplateFor(workoutsSorted),
+    nextTemplate: nextTemplateFor(workoutsSorted, sequenceFor(p.program_id)),
     lastMainLift: heaviestSet(lastWorkout),
+    programId: p.program_id || null,
 
     pendingProposal: u.pending || null,
   };

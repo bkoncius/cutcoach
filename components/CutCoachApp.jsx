@@ -25,7 +25,7 @@ import {
 import { getSupabase } from "../lib/supabaseClient";
 import { read as readLedger, write as writeLedger, clear as clearLedger } from "../lib/ledgerCache";
 import { syncPushSubscription, unsubscribePush } from "../lib/pushClient";
-import { PROGRAM, SEQUENCE, nextTemplateFor } from "../lib/program";
+import { getTemplate, programFor, nextTemplateFor, finisherFor } from "../lib/programs";
 import { computeTrend, trendSeries } from "../lib/trend";
 import { runEngine } from "../lib/engine";
 import { laneVerdict, laneText, laneRules, weeksInLane } from "../lib/lanes";
@@ -34,6 +34,7 @@ import { ageFrom, suggestTargets, checkGoal } from "../lib/calc";
 import NotificationSettings from "./NotificationSettings";
 import Onboarding from "./Onboarding";
 import ProfileCard from "./ProfileCard";
+import ProgramCard from "./ProgramCard";
 import ProposalCard from "./ProposalCard";
 import { Card, Eyebrow, Bar } from "./ui";
 
@@ -66,6 +67,8 @@ const DEFAULT_SETTINGS = {
   bodyfatPct: null,
   phaseStartedAt: null,
   onboardedAt: null,
+  programId: null, // programFor() falls back to ul4-gym
+  emphasis: null,
 };
 
 // Lane prose no longer lives here — it's GENERATED from lib/lanes.js with the user's
@@ -197,6 +200,7 @@ export default function CutCoachApp({ userId }) {
   const rememberReminders = (timezone, reminders) =>
     setSettings((s) => ({ ...s, timezone, reminders }));
   const rememberIdentity = (p) => setSettings((s) => ({ ...s, ...p }));
+  const rememberProgram = (programId, emphasis) => setSettings((s) => ({ ...s, programId, emphasis }));
 
   const logWeight = (date, weight) => {
     setDays((d) => ({ ...d, [date]: { ...(d[date] || { meals: [] }), weight } }));
@@ -271,13 +275,16 @@ export default function CutCoachApp({ userId }) {
   const lastOfTemplate = (t) =>
     [...workouts].filter((w) => w.template === t).sort((a, b) => b.date.localeCompare(a.date))[0];
 
-  const suggestedTemplate = nextTemplateFor(workouts);
+  const program = programFor(settings.programId);
+  const suggestedTemplate = nextTemplateFor(workouts, program.sequence);
 
   /* ---------- coach context ---------- */
 
   const buildContext = () => {
     const workoutByDate = {};
-    workouts.forEach((w) => { workoutByDate[w.date] = PROGRAM[w.template].name; });
+    // getTemplate never throws on unknown ids — history from an old program renders
+    // its name instead of crashing the whole Coach tab.
+    workouts.forEach((w) => { workoutByDate[w.date] = getTemplate(settings.programId, w.template).name; });
 
     const lines = [];
     for (let i = 13; i >= 0; i--) {
@@ -311,7 +318,7 @@ export default function CutCoachApp({ userId }) {
         })
         .filter(Boolean)
         .join("; ");
-      return `${shortDate(w.date)} ${PROGRAM[w.template].name}${w.finisher ? " +cardio" : ""} — ${ex || "logged"}`;
+      return `${shortDate(w.date)} ${getTemplate(settings.programId, w.template).name}${w.finisher ? " +cardio" : ""} — ${ex || "logged"}`;
     });
 
     // Lane rules are GENERATED from lib/lanes.js with the user's actual weight — the
@@ -328,7 +335,7 @@ export default function CutCoachApp({ userId }) {
     const name = settings.displayName || "the client";
     const sexWord = settings.sex === "male" ? "male" : settings.sex === "female" ? "female" : "unspecified sex";
     const age = settings.birthdate ? ageFrom(settings.birthdate) : null;
-    const identity = `You are the built-in AI coach in CutCoach, a personal training & nutrition app. Client: ${name}, ${sexWord}${age ? `, ${age}` : ""}${settings.heightCm ? `, ${Math.round(settings.heightCm)} cm` : ""}${settings.bodyfatPct ? `, ~${settings.bodyfatPct}% body fat` : ""}. ${settings.experience || "intermediate"} lifter, ${settings.equipment === "gym" ? "full gym" : settings.equipment === "dumbbells" ? "dumbbells only" : settings.equipment === "bodyweight" ? "no equipment" : "full gym"}, ${settings.daysPerWeek || 4} training days/week. Program: 4-day upper/lower split with Zone-2/interval finishers.`;
+    const identity = `You are the built-in AI coach in CutCoach, a personal training & nutrition app. Client: ${name}, ${sexWord}${age ? `, ${age}` : ""}${settings.heightCm ? `, ${Math.round(settings.heightCm)} cm` : ""}${settings.bodyfatPct ? `, ~${settings.bodyfatPct}% body fat` : ""}. ${settings.experience || "intermediate"} lifter, ${settings.equipment === "gym" ? "full gym" : settings.equipment === "dumbbells" ? "dumbbells only" : settings.equipment === "bodyweight" ? "no equipment" : "full gym"}, ${settings.daysPerWeek || 4} training days/week. Program: ${program.name} with cardio finishers.`;
     const femaleNote =
       settings.sex === "female"
         ? "\nFemale-specific: expect intra-month water-weight fluctuations of 1-2 kg on a roughly monthly rhythm; judge progress across 2-4 week trend windows and never recommend calorie cuts in response to a single-week stall that may coincide with cyclical retention."
@@ -428,6 +435,7 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
             goTrain={() => setTab("train")} goCoach={() => setTab("coach")}
             showSettings={showSettings} setShowSettings={setShowSettings}
             signOut={signOut} saveReminders={rememberReminders} saveIdentityLocal={rememberIdentity}
+            saveProgramLocal={rememberProgram}
             proposal={proposal}
             onProposalApplied={(res, p) => {
               if (!res.alreadyActed) {
@@ -448,6 +456,8 @@ ${recentW.length ? recentW.join("\n") : "None logged yet."}`;
             active={active} setActive={setActive}
             workouts={workouts} onSaveWorkout={saveWorkoutFn}
             lastOfTemplate={lastOfTemplate} suggestedTemplate={suggestedTemplate}
+            program={program} programId={settings.programId}
+            emphasis={settings.emphasis} phase={settings.phase}
           />
         )}
         {tab === "trend" && (
@@ -499,7 +509,7 @@ function TodayTab({
   settings, persistSettings, days, logWeight, kcalToday, protToday,
   trendState, weightEntries, suggestedTemplate, goTrain, goCoach,
   showSettings, setShowSettings, signOut, saveReminders, saveIdentityLocal,
-  proposal, onProposalApplied, onProposalDismissed,
+  saveProgramLocal, proposal, onProposalApplied, onProposalDismissed,
 }) {
   const tk = todayKey();
   const units = settings.units || "metric";
@@ -554,7 +564,7 @@ function TodayTab({
   const inLaneWeeks = isMaintain ? weeksInLane(weightEntries, tk, "maintain", laneProfile) : 0;
 
   const checkedInToday = settings.lastCheckin === tk;
-  const sugg = PROGRAM[suggestedTemplate];
+  const sugg = getTemplate(settings.programId, suggestedTemplate, settings.emphasis);
 
   const dateStr = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
 
@@ -577,6 +587,7 @@ function TodayTab({
               own draft state and its own narrow DB writer, so a save from one can never
               rewrite another's columns from stale in-memory values. */}
           <ProfileCard settings={settings} onSaved={saveIdentityLocal} />
+          <ProgramCard settings={settings} onSaved={saveProgramLocal} />
           <NotificationSettings settings={settings} onSaved={saveReminders} />
         </>
       )}
@@ -1276,13 +1287,18 @@ function MacroInput({ value, set, label }) {
 
 /* ---------------- Train ---------------- */
 
-function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, suggestedTemplate }) {
+function TrainTab({
+  active, setActive, workouts, onSaveWorkout, lastOfTemplate, suggestedTemplate,
+  program, programId, emphasis, phase,
+}) {
   const [saveErr, setSaveErr] = useState("");
   if (active) {
     return (
       <ActiveWorkout
         active={active}
         setActive={setActive}
+        template={getTemplate(programId, active.template, emphasis)}
+        phase={phase}
         onFinish={async (session) => {
           try {
             setSaveErr("");
@@ -1299,9 +1315,14 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
 
   const start = (templateId) => {
     const prev = lastOfTemplate(templateId);
-    const exercises = PROGRAM[templateId].exercises.map((ex) => {
-      const prevEx = prev && prev.exercises.find((e) => e.name === ex.name);
+    const exercises = getTemplate(programId, templateId, emphasis).exercises.map((ex) => {
+      // Prefill by exercise id first (stable across renames), name for legacy rows.
+      const prevEx =
+        prev &&
+        (prev.exercises.find((e) => e.id && ex.id && e.id === ex.id) ||
+          prev.exercises.find((e) => e.name === ex.name));
       return {
+        id: ex.id,
         name: ex.name,
         target: `${ex.sets} × ${ex.reps}${ex.rpe !== "—" ? ` @ RPE ${ex.rpe}` : ""}`,
         prev: prevEx
@@ -1322,12 +1343,12 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
   return (
     <div className="space-y-4">
       <div>
-        <Eyebrow color="text-amber-400">Train</Eyebrow>
+        <Eyebrow color="text-amber-400">Train · {program.name}</Eyebrow>
         <h1 className="text-xl font-bold tracking-tight mt-1">Pick your session</h1>
       </div>
 
-      {SEQUENCE.map((tid) => {
-        const t = PROGRAM[tid];
+      {program.sequence.map((tid) => {
+        const t = getTemplate(programId, tid, emphasis);
         const last = lastOfTemplate(tid);
         const isNext = tid === suggestedTemplate;
         return (
@@ -1339,7 +1360,7 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
                     {isNext && <span className="ml-2 text-xs font-mono text-amber-400">up next</span>}
                   </div>
                   <div className="text-xs text-slate-500 mt-1">
-                    {t.subtitle} · {t.exercises.length} lifts · {t.finisher}
+                    {t.subtitle} · {t.exercises.length} lifts · {finisherFor(t, phase)}
                   </div>
                   {last && <div className="text-xs font-mono text-slate-600 mt-1">last: {shortDate(last.date)}</div>}
                 </div>
@@ -1356,7 +1377,9 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
           <div className="mt-2 divide-y divide-slate-800">
             {history.map((w) => (
               <div key={w.id} className="py-2 flex justify-between text-sm">
-                <span>{PROGRAM[w.template].name}</span>
+                {/* Resolver, not a raw lookup: rows from a previous program must render,
+                    not crash the tab. */}
+                <span>{getTemplate(programId, w.template).name}</span>
                 <span className="font-mono text-xs text-slate-500">
                   {shortDate(w.date)}{w.finisher ? " · +cardio" : ""}
                 </span>
@@ -1369,8 +1392,8 @@ function TrainTab({ active, setActive, workouts, onSaveWorkout, lastOfTemplate, 
   );
 }
 
-function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
-  const t = PROGRAM[active.template];
+function ActiveWorkout({ active, setActive, template, phase, onFinish, saveErr }) {
+  const t = template;
   const [state, setState] = useState(active);
 
   const updSet = (ei, si, field, val) => {
@@ -1400,6 +1423,9 @@ function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
       template: state.template,
       finisher: state.finisher,
       exercises: state.exercises.map((e) => ({
+        // id makes future prefill matching survive exercise renames; name kept for
+        // display and legacy compatibility.
+        ...(e.id ? { id: e.id } : {}),
         name: e.name,
         sets: e.sets.filter((s) => s.w || s.r).map((s) => ({ w: s.w, r: s.r })),
       })),
@@ -1466,7 +1492,7 @@ function ActiveWorkout({ active, setActive, onFinish, saveErr }) {
       >
         <Card className={`flex items-center gap-3 ${state.finisher ? "border-teal-400 border-opacity-40" : ""}`}>
           <Flame size={18} className={state.finisher ? "text-teal-400" : "text-slate-600"} />
-          <div className="text-sm flex-1">Finisher: {t.finisher}</div>
+          <div className="text-sm flex-1">Finisher: {finisherFor(t, phase)}</div>
           {state.finisher && <Check size={16} className="text-teal-400" />}
         </Card>
       </button>

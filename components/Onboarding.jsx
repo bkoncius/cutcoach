@@ -5,6 +5,7 @@ import { ChevronRight, ChevronLeft, Check, Dumbbell } from "lucide-react";
 import { Card, Eyebrow } from "./ui";
 import { ACTIVITY_LEVELS, suggestTargets, checkGoal, etaRange, ageFrom } from "../lib/calc";
 import { laneText } from "../lib/lanes";
+import { selectProgram, programFor } from "../lib/programs";
 import {
   formatWeight, weightUnit, parseWeightInput, validWeightKg, cmToFtIn, ftInToCm,
 } from "../lib/units";
@@ -103,6 +104,7 @@ export default function Onboarding({ settings, onComplete }) {
   const [experience, setExperience] = useState(s0.experience || null);
   const [equipment, setEquipment] = useState(s0.equipment || null);
   const [daysPerWeek, setDaysPerWeek] = useState(s0.daysPerWeek || 4);
+  const [emphasis, setEmphasis] = useState(s0.emphasis || "balanced");
 
   const weightKg = parseWeightInput(weightDraft, units);
   const goalKg = phase === "maintain" ? weightKg : parseWeightInput(goalDraft, units);
@@ -161,6 +163,8 @@ export default function Onboarding({ settings, onComplete }) {
         daysPerWeek,
         units,
         bodyfatPct,
+        programId: selectProgram({ daysPerWeek, equipment }),
+        emphasis: emphasis === "balanced" ? null : emphasis,
         phase,
         kcalTarget: plan.kcalTarget,
         proteinTarget: plan.proteinTarget,
@@ -297,6 +301,17 @@ export default function Onboarding({ settings, onComplete }) {
           ))}
         </div>
       </Field>
+      <Field label="Training emphasis — your call, adjustable any time">
+        <OptionGrid
+          options={[
+            { id: "balanced", label: "Balanced", desc: "Even push/pull/legs development" },
+            { id: "lower_glutes", label: "Lower & glutes", desc: "Extra hip-thrust and glute volume" },
+            { id: "upper", label: "Upper body", desc: "Extra back and shoulder volume" },
+          ]}
+          value={emphasis}
+          onChange={setEmphasis}
+        />
+      </Field>
     </div>,
 
     /* ---------- 4: the plan ---------- */
@@ -328,8 +343,11 @@ export default function Onboarding({ settings, onComplete }) {
           <Card className="flex items-center gap-3">
             <Dumbbell size={18} className="text-teal-400" />
             <div className="text-sm">
-              <div className="font-semibold">Upper/Lower · 4-day</div>
-              <div className="text-xs text-slate-500">Your program to start — more options coming; every exercise is adjustable.</div>
+              <div className="font-semibold">{programFor(selectProgram({ daysPerWeek, equipment })).name}</div>
+              <div className="text-xs text-slate-500">
+                Picked for {daysPerWeek} days/week with {equipment === "gym" ? "a full gym" : equipment === "dumbbells" ? "dumbbells" : "no equipment"}
+                {emphasis !== "balanced" ? `, ${emphasis === "lower_glutes" ? "lower/glute" : "upper-body"} emphasis` : ""}. Change it any time in settings.
+              </div>
             </div>
           </Card>
         </>
