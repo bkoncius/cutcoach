@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { Dumbbell } from "lucide-react";
 import { Card, Eyebrow } from "./ui";
-import { LIBRARY, DEFAULT_PROGRAM_ID, selectProgram } from "../lib/programs";
+import { LIBRARY, DEFAULT_PROGRAM_ID, selectProgram, programFor } from "../lib/programs";
 import { saveProgram } from "../lib/db";
 
 /* Settings sibling for the training program — own draft, own narrow writer
@@ -17,7 +17,12 @@ export default function ProgramCard({ settings, onSaved }) {
   const [msg, setMsg] = useState(null);
 
   const suggested = selectProgram({ daysPerWeek: settings.daysPerWeek, equipment: settings.equipment });
-  const showHint = suggested !== programId;
+  // Hint only when the chosen program disagrees with the profile's days/equipment —
+  // a deliberate variant with the same shape (fb3-gym vs fb3-gym-str) is not a mismatch.
+  const chosen = programFor(programId);
+  const showHint =
+    LIBRARY[suggested].daysPerWeek !== chosen.daysPerWeek ||
+    LIBRARY[suggested].equipment !== chosen.equipment;
 
   const save = async () => {
     setBusy(true);

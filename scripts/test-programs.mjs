@@ -40,6 +40,20 @@ t("every template: unique exercise ids, ≥4 exercises, every sequence id resolv
 t("ul5 shares ul4's template objects for the overlapping days (identity, not copy)", () => {
   assert.equal(LIBRARY["ul5-gym"].templates.lowerA, LIBRARY["ul4-gym"].templates.lowerA);
 });
+t("fb3-gym-str reuses ul4 exercise ids so prefill carries over on the switch", () => {
+  const ul4Ids = new Set(
+    Object.values(LIBRARY["ul4-gym"].templates).flatMap((t) => t.exercises.map((e) => e.id))
+  );
+  const str = LIBRARY["fb3-gym-str"];
+  assert.deepEqual(str.sequence, ["fb3sA", "fb3sB", "fb3sC"]);
+  for (const tid of str.sequence) {
+    for (const e of str.templates[tid].exercises) {
+      assert.ok(ul4Ids.has(e.id), `${tid}: ${e.id} has no ul4 history to prefill from`);
+    }
+  }
+  // template ids must not collide with the generic fb3-gym (different content)
+  for (const tid of str.sequence) assert.ok(!LIBRARY["fb3-gym"].templates[tid]);
+});
 
 console.log("\ngetTemplate — the crash-site fix");
 t("own program resolves", () => {
